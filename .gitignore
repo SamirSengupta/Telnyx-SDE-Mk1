@@ -1,0 +1,22 @@
+# ---- Secrets: never commit ----
+gmail_Creds.json
+gmail_creds.json
+gmail_token.json
+*.creds.json
+*_creds.json
+.env
+.env.*
+!.env.example
+
+# ---- Generated data / runtime ----
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/models.json
+
+# ---- Python ----
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/

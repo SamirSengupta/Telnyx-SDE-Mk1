@@ -1,0 +1,594 @@
+<!doctype html>
+<!--
+  Quinn CRM dashboard (single file, zero dependencies).
+
+  What this page does: renders the full state of the Quinn inbound pipeline as
+  a black-and-white CRM. Three tabs:
+    * Pipeline      - every lead, its FSM state, tier, and outreach status;
+                      clicking a row opens the lead's complete journey (every
+                      agent decision with its rationale, the draft, deliveries).
+    * Approvals     - the human work queue for the two-step gate:
+                      step 1 approve -> Gmail draft created -> "check Drafts",
+                      step 2 send    -> the checked draft actually goes out.
+    * Observability - the persisted event stream + every LLM call with its full
+                      system prompt, user prompt and raw response.
+
+  All data comes from the JSON API in quinn/web.py, which reads the same SQLite
+  tables the pipeline writes. The page polls every 4s; action buttons POST to
+  /api/action, which calls the same human_approve/human_send/human_reject
+  functions as the CLI, so idempotency holds whichever surface is used.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quinn — Inbound CRM</title>
+<style>
+  :root{
+    --ink:#000; --paper:#fff;
+    --g1:#f6f6f6; --g2:#e8e8e8; --g3:#bdbdbd; --g4:#6f6f6f;
+    --mono:ui-monospace,'Cascadia Code',Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--paper);color:var(--ink);
+       font:14px/1.5 -apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}
+  /* ---------- chrome ---------- */
+  header{display:flex;align-items:center;gap:14px;padding:14px 24px;
+         border-bottom:2px solid var(--ink)}
+  header img{height:26px;display:block}
+  header .title{font-size:15px;font-weight:700;letter-spacing:.02em}
+  header .sub{color:var(--g4);font-size:12px;margin-left:auto;font-family:var(--mono)}
+  nav{display:flex;gap:2px;padding:0 24px;border-bottom:1px solid var(--g2)}
+  nav button{appearance:none;border:0;background:none;font:inherit;font-weight:600;
+             padding:12px 16px;cursor:pointer;color:var(--g4);
+             border-bottom:2px solid transparent;margin-bottom:-1px}
+  nav button.on{color:var(--ink);border-bottom-color:var(--ink)}
+  nav button .n{display:inline-block;min-width:18px;padding:0 5px;margin-left:6px;
+                border:1px solid var(--ink);border-radius:9px;font-size:11px;
+                text-align:center;background:var(--ink);color:var(--paper)}
+  main{padding:20px 24px 80px;max-width:1280px;margin:0 auto}
+  /* ---------- stat tiles ---------- */
+  .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));
+         gap:10px;margin-bottom:22px}
+  .tile{border:1px solid var(--ink);padding:10px 12px;cursor:pointer;
+        user-select:none}
+  .tile:hover{background:var(--g1)}
+  .tile b{display:block;font-size:22px;line-height:1.1}
+  .tile span{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--g4)}
+  .tile.inv{background:var(--ink);color:var(--paper)}
+  .tile.inv:hover{background:#2a2a2a}
+  .tile.inv span{color:var(--g3)}
+  .tile.sel{outline:3px solid var(--ink);outline-offset:-1px}
+  /* ---------- table ---------- */
+  table{width:100%;border-collapse:collapse;border:1px solid var(--ink)}
+  th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;text-align:left;
+     padding:8px 10px;border-bottom:2px solid var(--ink);background:var(--g1)}
+  td{padding:8px 10px;border-bottom:1px solid var(--g2);vertical-align:top}
+  tr.click{cursor:pointer}
+  tr.click:hover{background:var(--g1)}
+  .badge{display:inline-block;border:1px solid var(--ink);padding:0 8px;
+         font-size:11px;font-weight:700;letter-spacing:.04em}
+  .badge.Hot{background:var(--ink);color:var(--paper)}
+  .badge.Warm{background:var(--g4);border-color:var(--g4);color:var(--paper)}
+  .badge.Mild{background:var(--paper)}
+  .badge.Cold{color:var(--g4);border-color:var(--g3)}
+  .state{font-family:var(--mono);font-size:12px}
+  .muted{color:var(--g4)} .small{font-size:12px}
+  .mono{font-family:var(--mono);font-size:12px}
+  /* ---------- drawer ---------- */
+  #ov{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none}
+  #drawer{position:fixed;top:0;right:0;bottom:0;width:min(680px,94vw);
+          background:var(--paper);border-left:2px solid var(--ink);display:none;
+          overflow-y:auto;padding:22px 26px;z-index:10}
+  #drawer h2{font-size:17px;margin-bottom:2px}
+  #drawer .x{position:sticky;top:0;float:right;border:1px solid var(--ink);
+             background:var(--paper);font:700 13px/1 var(--mono);padding:6px 10px;
+             cursor:pointer}
+  .sect{margin-top:20px}
+  .sect h3{font-size:11px;text-transform:uppercase;letter-spacing:.08em;
+           border-bottom:1px solid var(--ink);padding-bottom:4px;margin-bottom:10px}
+  .kv{display:grid;grid-template-columns:150px 1fr;gap:2px 12px;font-size:13px}
+  .kv dt{color:var(--g4)} .kv dd{margin:0}
+  /* journey timeline */
+  .step{border-left:2px solid var(--ink);margin-left:6px;padding:0 0 14px 14px;
+        position:relative}
+  .step::before{content:'';position:absolute;left:-6px;top:3px;width:10px;height:10px;
+                background:var(--paper);border:2px solid var(--ink);border-radius:50%}
+  .step.human::before{background:var(--ink)}
+  .step .hd{font-weight:700;font-size:13px}
+  .step .hd .mono{font-weight:400;color:var(--g4)}
+  .step p{font-size:13px;margin-top:2px}
+  .flag{border:1px solid var(--ink);background:var(--g1);font-size:12px;
+        padding:1px 6px;display:inline-block;margin:2px 4px 0 0}
+  /* draft + prompts */
+  .paperbox{border:1px solid var(--ink);padding:12px 14px;white-space:pre-wrap;
+            font-size:13px;background:var(--g1)}
+  details{border:1px solid var(--g3);margin-bottom:8px}
+  details summary{cursor:pointer;padding:7px 10px;font-family:var(--mono);
+                  font-size:12px;list-style:none;display:flex;gap:10px;flex-wrap:wrap}
+  details summary::before{content:'+';font-weight:700;width:12px}
+  details[open] summary::before{content:'−'}
+  details .body{border-top:1px solid var(--g3);padding:10px}
+  details .body h4{font:700 11px/1 var(--mono);text-transform:uppercase;
+                   letter-spacing:.06em;margin:10px 0 4px;color:var(--g4)}
+  details .body pre{white-space:pre-wrap;font:12px/1.5 var(--mono);
+                    background:var(--g1);border:1px solid var(--g2);padding:8px;
+                    max-height:340px;overflow:auto}
+  /* buttons */
+  .btn{appearance:none;font:600 13px/1 inherit;padding:9px 16px;cursor:pointer;
+       border:1px solid var(--ink);background:var(--paper);color:var(--ink)}
+  .btn.primary{background:var(--ink);color:var(--paper)}
+  .btn:disabled{opacity:.4;cursor:default}
+  .btn+.btn{margin-left:8px}
+  /* approvals */
+  .card{border:1px solid var(--ink);margin-bottom:16px}
+  .card .cardhd{display:flex;align-items:center;gap:10px;padding:10px 14px;
+                border-bottom:1px solid var(--ink);background:var(--g1)}
+  .card .cardhd .who{font-weight:700}
+  .card .cardbd{padding:12px 14px}
+  .card .row{margin-bottom:6px;font-size:13px}
+  .card .row b{font-size:11px;text-transform:uppercase;letter-spacing:.06em;
+               color:var(--g4);display:inline-block;min-width:86px}
+  .card .actions{padding:12px 14px;border-top:1px solid var(--g2)}
+  .notice{border:2px solid var(--ink);background:var(--g1);padding:10px 14px;
+          font-weight:600;margin-bottom:10px}
+  .filter{display:flex;gap:10px;align-items:center;margin-bottom:14px}
+  .filter input{border:1px solid var(--ink);padding:7px 10px;font:inherit;width:130px}
+  .empty{border:1px dashed var(--g3);color:var(--g4);padding:28px;text-align:center}
+  h2.tabtitle{font-size:15px;margin-bottom:12px}
+  .twocol{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+  @media(max-width:900px){.twocol{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<header>
+  <img src="/logo" alt="Telnyx">
+  <div class="title">Quinn — Inbound CRM</div>
+  <div class="sub" id="hdr-sub">loading…</div>
+</header>
+
+<nav>
+  <button data-tab="pipeline" class="on">Pipeline</button>
+  <button data-tab="approvals">Approvals<span class="n" id="n-appr">0</span></button>
+  <button data-tab="obs">Observability</button>
+  <button data-tab="config">Configure Agent</button>
+</nav>
+
+<main>
+  <div class="tiles" id="tiles"></div>
+  <section id="tab-pipeline"></section>
+  <section id="tab-approvals" style="display:none"></section>
+  <section id="tab-obs" style="display:none"></section>
+  <section id="tab-config" style="display:none"></section>
+</main>
+
+<div id="ov" onclick="closeDrawer()"></div>
+<aside id="drawer"></aside>
+
+<script>
+'use strict';
+/* ------------------------------------------------------------------ state */
+let TAB = 'pipeline';
+let S = null;              // /api/summary
+let LEADS = [];            // /api/leads
+let DRAWER_ID = null;      // open lead drawer (persists across refreshes)
+let OBS_FILTER = '';       // lead-id filter on the observability tab
+const OPEN = new Set();    // ids of expanded <details>, survive re-render
+
+const esc = s => String(s ?? '').replace(/[&<>"]/g,
+      c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const get = async p => (await fetch(p)).json();
+const post = async (action, id) => {
+  const r = await fetch('/api/action', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({action, id})});
+  return r.json();
+};
+const tierBadge = t => t ? `<span class="badge ${esc(t)}">${esc(t)}</span>` : '—';
+const emailWord = {none:'awaiting approval', drafted:'draft — check Gmail',
+                   sent:'EMAIL SENT', rejected:'rejected'};
+
+/* ------------------------------------------------------------------ tabs */
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  TAB = b.dataset.tab;
+  document.querySelectorAll('nav button').forEach(x =>
+    x.classList.toggle('on', x === b));
+  ['pipeline','approvals','obs','config'].forEach(t =>
+    document.getElementById('tab-'+t).style.display = t===TAB ? '' : 'none');
+  refresh(true);
+});
+
+/* ------------------------------------------------------------------ tiles */
+// Every tile is a shortcut: counts navigate to the tab that explains them,
+// tier tiles additionally filter the pipeline to that tier (click again to clear).
+let TIER_FILTER = null;
+function goTab(tab){
+  document.querySelector(`nav button[data-tab="${tab}"]`).click();
+}
+function tileTier(t){
+  TIER_FILTER = (TIER_FILTER === t) ? null : t;
+  if (TAB === 'pipeline'){ renderTiles(); renderPipeline(); }
+  else goTab('pipeline');
+}
+function tileAll(){ TIER_FILTER = null; goTab('pipeline'); }
+
+function renderTiles(){
+  const t = S.tiers||{}, appr = S.awaiting_approval.length,
+        drafts = S.awaiting_send.length;
+  const selT = x => TIER_FILTER === x ? 'sel' : '';
+  document.getElementById('tiles').innerHTML = `
+    <div class="tile" onclick="tileAll()"><b>${S.total_leads}</b><span>inbound leads</span></div>
+    <div class="tile ${selT('Hot')}"  onclick="tileTier('Hot')"><b>${t.Hot||0}</b><span>hot</span></div>
+    <div class="tile ${selT('Warm')}" onclick="tileTier('Warm')"><b>${t.Warm||0}</b><span>warm</span></div>
+    <div class="tile ${selT('Mild')}" onclick="tileTier('Mild')"><b>${t.Mild||0}</b><span>mild</span></div>
+    <div class="tile ${selT('Cold')}" onclick="tileTier('Cold')"><b>${t.Cold||0}</b><span>cold / suppressed</span></div>
+    <div class="tile ${appr?'inv':''}" onclick="goTab('approvals')"><b>${appr}</b><span>awaiting approval</span></div>
+    <div class="tile ${drafts?'inv':''}" onclick="goTab('approvals')"><b>${drafts}</b><span>drafts to check</span></div>
+    <div class="tile" onclick="goTab('approvals')"><b>${S.emails_sent}</b><span>emails sent</span></div>
+    <div class="tile" onclick="goTab('obs')"><b>${S.llm_calls}</b><span>agent calls</span></div>
+    <div class="tile" onclick="goTab('obs')"><b>${(S.tokens/1000).toFixed(1)}k</b><span>tokens</span></div>`;
+  document.getElementById('n-appr').textContent = appr + drafts;
+  document.getElementById('hdr-sub').textContent =
+    `state: data/quinn.db · autorefresh 4s`;
+}
+
+/* ------------------------------------------------------------------ pipeline */
+function renderPipeline(){
+  const shown = TIER_FILTER
+    ? LEADS.filter(l => l.final_tier === TIER_FILTER)
+    : LEADS;
+  const rows = shown.map(l => `
+    <tr class="click" onclick="openDrawer(${l.inbound_id})">
+      <td class="mono">${l.inbound_id}</td>
+      <td><b>${esc(l.name)}</b><br><span class="muted small">${esc(l.role)}</span></td>
+      <td>${esc(l.company)}<br><span class="muted small">${esc(l.industry||'')}</span></td>
+      <td>${tierBadge(l.final_tier)}</td>
+      <td class="state">${esc(l.state)}</td>
+      <td class="small">${esc(l.topic||'—')}</td>
+      <td class="small">${esc(l.current_provider||'—')}<br>
+          <span class="muted">${esc(l.monthly_volume||'')}</span></td>
+      <td class="small">${l.state === 'DONE'
+          ? esc(emailWord[l.email_status]||l.email_status)
+          : '<span class="muted">—</span>'}</td>
+    </tr>`).join('');
+  const title = TIER_FILTER
+    ? `${TIER_FILTER} leads only (${shown.length}) —
+       <a href="javascript:tileTier('${TIER_FILTER}')"
+          style="color:var(--ink)">show all</a>`
+    : 'All leads — what the agent decided, and where each one stands';
+  document.getElementById('tab-pipeline').innerHTML = `
+    <h2 class="tabtitle">${title}</h2>
+    <table><thead><tr>
+      <th>#</th><th>Lead</th><th>Company</th><th>Tier</th><th>State</th>
+      <th>Topic</th><th>Incumbent / volume</th><th>Outreach</th>
+    </tr></thead><tbody>${rows ||
+      '<tr><td colspan="8" class="empty">no leads match — click the tier tile again to clear the filter</td></tr>'}
+    </tbody></table>`;
+}
+
+/* ------------------------------------------------------------------ approvals */
+function apprCard(l, d){
+  // d = full /api/lead detail, fetched BEFORE rendering so the card appears
+  // complete in one paint (no "loading rationale…" flash on every refresh).
+  const st = l.email_status;
+  let banner = '', act = '';
+  if (st === 'none'){
+    act = `<button class="btn primary" onclick="act('approve',${l.inbound_id},this)">
+             Approve → create Gmail draft</button>
+           <button class="btn" onclick="act('reject',${l.inbound_id},this)">Reject</button>`;
+  } else if (st === 'drafted'){
+    banner = `<div class="notice">Draft created — open Gmail → Drafts and check
+              it. When it reads right, hit Send below.</div>`;
+    act = `<button class="btn primary" onclick="act('send',${l.inbound_id},this)">
+             Checked — send it</button>
+           <button class="btn" onclick="act('reject',${l.inbound_id},this)">Reject &amp; discard draft</button>`;
+  }
+  const q = (d.decisions.filter(x=>x.stage==='qualify').pop()||{}).raw || {};
+  const j = (d.decisions.filter(x=>x.stage==='judge').pop()||{}).raw || {};
+  return `
+  <div class="card">
+    <div class="cardhd">
+      ${tierBadge(l.final_tier)}
+      <span class="who">${esc(l.name)} — ${esc(l.company)}</span>
+      <span class="muted small">${esc(l.role)}</span>
+      <span class="muted small" style="margin-left:auto">lead ${l.inbound_id}</span>
+    </div>
+    <div class="cardbd">
+      <div class="row"><b>asked</b> ${esc(l.request_for)}</div>
+      <div class="row"><b>why ${esc(l.final_tier)}</b>
+        icp_fit ${q.icp_fit ?? '?'} · intent ${q.intent ?? '?'} —
+        ${esc((q.signals||[]).slice(0,4).join('; '))}</div>
+      <div class="row"><b>judge</b> ${j.agree ? 'agrees' : 'OVERRODE'} —
+        ${esc(j.reason||'')}
+        ${(j.hallucination_flags||[]).map(f=>`<span class="flag">⚠ ${esc(f)}</span>`).join('')}</div>
+      <div class="row"><b>next step</b> ${esc(d.next_step||'')}</div>
+      <div class="row"><b>draft</b> “${esc(d.draft.subject||'')}”</div>
+      <div class="paperbox small">${esc(d.draft.body||'')}</div>
+    </div>
+    <div class="actions">${banner}${act}
+      <button class="btn" onclick="openDrawer(${l.inbound_id})">Full journey</button>
+    </div>
+  </div>`;
+}
+
+async function renderApprovals(){
+  const q1 = LEADS.filter(l => l.state==='DONE' && l.email_status==='none');
+  const q2 = LEADS.filter(l => l.state==='DONE' && l.email_status==='drafted');
+  const held = LEADS.filter(l => ['HELD','FAILED'].includes(l.state));
+  // Fetch every card's detail first, then swap the DOM exactly once.
+  const details = Object.fromEntries(await Promise.all(
+    [...q1, ...q2].map(async l => [l.inbound_id,
+      await get('/api/lead?id=' + l.inbound_id)])));
+  document.getElementById('tab-approvals').innerHTML = `
+    <h2 class="tabtitle">Step 1 — approve the outreach (${q1.length})</h2>
+    ${q1.map(l => apprCard(l, details[l.inbound_id])).join('')
+       || '<div class="empty">nothing awaiting approval</div>'}
+    <h2 class="tabtitle" style="margin-top:26px">Step 2 — check the Gmail draft, then send (${q2.length})</h2>
+    ${q2.map(l => apprCard(l, details[l.inbound_id])).join('')
+       || '<div class="empty">no drafts waiting</div>'}
+    ${held.length ? `<h2 class="tabtitle" style="margin-top:26px">Parked (HELD / FAILED — needs a human)</h2>
+      <table><thead><tr><th>#</th><th>Lead</th><th>State</th><th>Last error</th><th></th></tr></thead><tbody>
+      ${held.map(l => `<tr><td class="mono">${l.inbound_id}</td>
+        <td>${esc(l.name)} — ${esc(l.company)}</td>
+        <td class="state">${esc(l.state)}</td>
+        <td class="small muted">${esc(l.last_error||'')}</td>
+        <td><button class="btn" onclick="act('reopen',${l.inbound_id},this)">Re-arm</button></td>
+        </tr>`).join('')}</tbody></table>` : ''}`;
+}
+
+/* ------------------------------------------------------------------ observability */
+let OBS_PAGE = 1;                 // agent-call pagination (10 per page)
+const OBS_PER_PAGE = 10;
+let obsSnapshot = '';             // skip re-render when nothing changed
+
+function setObsPage(p){ OBS_PAGE = p; obsSnapshot = ''; renderObs(); }
+function setObsFilter(v){ OBS_FILTER = v.trim(); OBS_PAGE = 1; obsSnapshot = ''; renderObs(); }
+
+async function renderObs(){
+  const leadQ = OBS_FILTER ? ('?lead=' + OBS_FILTER) : '';
+  const [events, calls, costs] = await Promise.all([
+    get('/api/events' + leadQ), get('/api/llm' + leadQ), get('/api/costs')]);
+
+  // Anti-flicker: identical data + same page/filter -> leave the DOM alone
+  // (innerHTML swaps are what cause the visible jump during autorefresh).
+  const snap = JSON.stringify([OBS_FILTER, OBS_PAGE, events.length,
+                               calls.length, calls[0]?.id, events[0]?.id]);
+  if (snap === obsSnapshot) return;
+  obsSnapshot = snap;
+
+  const pages = Math.max(1, Math.ceil(calls.length / OBS_PER_PAGE));
+  if (OBS_PAGE > pages) OBS_PAGE = pages;
+  const pageCalls = calls.slice((OBS_PAGE-1)*OBS_PER_PAGE, OBS_PAGE*OBS_PER_PAGE);
+
+  const callRows = pageCalls.map(c => {
+    const id = 'llm-' + c.id;
+    const tok = (c.prompt_tokens||0) + (c.completion_tokens||0);
+    return `
+    <details id="${id}" ${OPEN.has(id)?'open':''} ontoggle="trackOpen(this)">
+      <summary>
+        <span>#${c.id}</span><span>lead ${c.inbound_id ?? '—'}</span>
+        <b>${esc(c.stage||c.task)}</b>
+        <span>${esc(c.used_model||c.requested_model)}</span>
+        <span>${esc(c.outcome)}${c.attempt>1 ? ' (attempt '+c.attempt+')':''}</span>
+        <span>${tok} tok</span><span>${c.latency_ms ?? '?'} ms</span>
+        <span class="muted" style="margin-left:auto">${esc(c.created_at)}</span>
+      </summary>
+      <div class="body">
+        <h4>system prompt (exactly as sent)</h4><pre>${esc(c.system_prompt||'(not captured — call predates prompt logging)')}</pre>
+        <h4>user prompt</h4><pre>${esc(c.user_prompt||'(not captured)')}</pre>
+        <h4>raw model response</h4><pre>${esc(c.response_text||'(none — transport error)')}</pre>
+      </div>
+    </details>`;}).join('');
+
+  const pager = pages > 1 ? `
+    <div class="filter" style="margin-top:10px">
+      <button class="btn" ${OBS_PAGE<=1?'disabled':''}
+              onclick="setObsPage(${OBS_PAGE-1})">&larr; newer</button>
+      <span class="mono small">page ${OBS_PAGE} / ${pages}</span>
+      <button class="btn" ${OBS_PAGE>=pages?'disabled':''}
+              onclick="setObsPage(${OBS_PAGE+1})">older &rarr;</button>
+    </div>` : '';
+
+  const evRows = events.map(e => {
+    let f = {};
+    try { f = JSON.parse(e.fields_json); } catch(_){}
+    const kv = Object.entries(f).filter(([k])=>k!=='inbound_id')
+      .map(([k,v]) => `${k}=${typeof v==='object'?JSON.stringify(v):v}`).join('  ');
+    const isTool = e.name === 'tool_call';
+    return `<tr><td class="mono">${e.id}</td>
+      <td class="mono">${e.inbound_id ?? '—'}</td>
+      <td>${isTool ? '<span class="badge Hot">tool</span> ' : ''}<b class="mono">${esc(e.name)}</b></td>
+      <td class="mono small">${esc(kv)}</td>
+      <td class="mono small muted">${esc(e.created_at)}</td></tr>`;}).join('');
+
+  const costRows = costs.map(r =>
+    `<tr><td>${esc(r.stage)}</td><td class="mono">${r.calls}</td>
+     <td class="mono">${r.prompt_tokens}</td><td class="mono">${r.completion_tokens}</td>
+     <td class="mono">${r.latency_ms}</td></tr>`).join('');
+
+  document.getElementById('tab-obs').innerHTML = `
+    <div class="filter">
+      <label class="small"><b>Filter by lead #</b></label>
+      <input id="obs-lead" value="${esc(OBS_FILTER)}" placeholder="all leads"
+             onchange="setObsFilter(this.value)">
+      <span class="muted small">every agent step, tool call, and model call below
+        is read from the persisted ledgers (pipeline_events, llm_calls) —
+        nothing is reconstructed from memory.</span>
+    </div>
+    <div class="twocol">
+      <div>
+        <h2 class="tabtitle">Agent calls — which model each agent invoked, the exact prompt, and what came back (${calls.length})</h2>
+        ${callRows || '<div class="empty">no agent calls recorded</div>'}
+        ${pager}
+        <h2 class="tabtitle" style="margin-top:22px">Spend by stage</h2>
+        <table><thead><tr><th>stage</th><th>calls</th><th>prompt tok</th>
+          <th>compl tok</th><th>total ms</th></tr></thead>
+          <tbody>${costRows}</tbody></table>
+      </div>
+      <div>
+        <h2 class="tabtitle">Agent step stream — every transition, decision, tool call, delivery, human action (${events.length})</h2>
+        <div style="max-height:72vh;overflow:auto;border:1px solid var(--ink)">
+        <table style="border:0"><thead><tr><th>#</th><th>lead</th><th>event</th><th>detail</th>
+          <th>at (utc)</th></tr></thead>
+          <tbody>${evRows || '<tr><td colspan="5" class="empty">no events yet</td></tr>'}</tbody></table>
+        </div>
+      </div>
+    </div>`;
+}
+function trackOpen(el){ el.open ? OPEN.add(el.id) : OPEN.delete(el.id); }
+
+/* ------------------------------------------------------------------ configure agent */
+async function renderConfig(){
+  const cfg = await get('/api/config');
+  const modelInfo = Object.fromEntries(cfg.models.map(m => [m.id, m]));
+  const cards = cfg.layers.map(l => {
+    const opts = cfg.models.map(m =>
+      `<option value="${esc(m.id)}" ${m.id===l.current?'selected':''}>${esc(m.id)}</option>`).join('');
+    return `
+    <div class="card">
+      <div class="cardhd">
+        <span class="who">${esc(l.task.toUpperCase())}</span>
+        <span class="muted small">${esc(l.about)}</span>
+      </div>
+      <div class="cardbd">
+        <div class="row"><b>current</b> <span class="mono">${esc(l.current)}</span>
+          ${l.overridden ? '<span class="flag">override</span>'
+                         : '<span class="muted small">(default)</span>'}</div>
+        <div class="row"><b>switch to</b>
+          <select id="sel-${l.task}" class="mono" style="padding:6px;border:1px solid var(--ink)"
+                  onchange="showNotes('${l.task}')">${opts}</select>
+        </div>
+        <div class="row" id="notes-${l.task}"></div>
+      </div>
+      <div class="actions">
+        <button class="btn primary" onclick="applyModel('${l.task}')">Apply</button>
+        ${l.overridden ? `<button class="btn" onclick="clearModel('${l.task}')">
+          Reset to default (${esc(l.default)})</button>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+  document.getElementById('tab-config').innerHTML = `
+    <h2 class="tabtitle">Configure Agent — the multi-LLM abstraction layer, live</h2>
+    <p class="small muted" style="max-width:760px;margin-bottom:16px">
+      Every agent routes through one abstraction (llm.py) to a multi-model proxy,
+      so each layer's model is just a routing entry. Changes here persist to
+      <span class="mono">data/models.json</span> and apply to the next lead
+      processed — no restart, and the CLI picks them up too.</p>
+    ${cards}`;
+  cfg.layers.forEach(l => showNotes(l.task, modelInfo));
+  window._modelInfo = modelInfo;
+}
+function showNotes(task, info){
+  info = info || window._modelInfo || {};
+  const sel = document.getElementById('sel-' + task);
+  const m = info[sel.value];
+  document.getElementById('notes-' + task).innerHTML = m ? `
+    <b>pros</b> ${esc(m.pros)}<br><b style="min-width:86px;display:inline-block">cons</b> ${esc(m.cons)}` : '';
+}
+async function applyModel(task){
+  const sel = document.getElementById('sel-' + task);
+  const r = await fetch('/api/config', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({task, model: sel.value})});
+  const d = await r.json();
+  if (d.error) alert('failed: ' + d.error);
+  renderConfig();
+}
+async function clearModel(task){
+  await fetch('/api/config', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({task, model: null})});
+  renderConfig();
+}
+
+/* ------------------------------------------------------------------ drawer */
+async function openDrawer(id){
+  DRAWER_ID = id;
+  document.getElementById('ov').style.display = 'block';
+  const dr = document.getElementById('drawer');
+  dr.style.display = 'block';
+  const d = await get('/api/lead?id=' + id);
+  const L = d.lead, R = d.run || {};
+  const steps = d.decisions.map(x => {
+    const human = ['human','operator'].includes(x.stage);
+    let extra = '';
+    if (x.stage === 'qualify' && x.raw.signals)
+      extra = (x.raw.signals||[]).map(s=>`<span class="flag">${esc(s)}</span>`).join('') +
+              `<p class="muted small">icp_fit ${x.raw.icp_fit} · intent ${x.raw.intent} · topic ${esc(x.raw.primary_topic||'')}</p>`;
+    if (x.stage === 'judge' && (x.raw.hallucination_flags||[]).length)
+      extra = x.raw.hallucination_flags.map(f=>`<span class="flag">⚠ ${esc(f)}</span>`).join('');
+    return `<div class="step ${human?'human':''}">
+      <div class="hd">${esc(x.stage)} → ${esc(x.verdict)}
+        <span class="mono">· ${esc(x.model)} · ${esc(x.created_at)}</span></div>
+      <p>${esc(x.rationale)}</p>${extra}</div>`;
+  }).join('');
+  const outbox = d.outbox.map(o => `<tr>
+      <td class="mono small">${esc(o.idempotency_key)}</td>
+      <td class="mono small">${esc(o.status)}</td>
+      <td class="mono small muted">${esc(o.provider_msg_id||'')}</td></tr>`).join('');
+  const enrich = L.person_name ? `
+      <dt>seniority</dt><dd>${esc(L.seniority)} — ${esc(L.department)} (${esc(L.dept_headcount)} in dept)</dd>
+      <dt>company</dt><dd>${esc(L.company_employees)} employees · ${esc(L.industry)} · ${esc(L.hq_region)}</dd>
+      <dt>revenue / funding</dt><dd>${esc(L.estimated_revenue_usd||'?')} · ${esc(L.funding_stage||'?')}</dd>
+      <dt>incumbent</dt><dd>${esc(L.current_provider||'—')} · volume ${esc(L.monthly_volume||'—')}</dd>
+      <dt>linkedin</dt><dd class="mono small">${esc(L.linkedin_url||'')}</dd>`
+    : '<dt>enrichment</dt><dd class="muted">none found — treated as weaker signal</dd>';
+  dr.innerHTML = `
+    <button class="x" onclick="closeDrawer()">CLOSE ✕</button>
+    <h2>${esc(L.name)} <span class="muted">(${esc(L.role)})</span></h2>
+    <div>${esc(L.company)} · ${tierBadge(R.final_tier)}
+      <span class="state">${esc(R.state||'—')}</span>
+      <span class="muted small">· email: ${esc(emailWord[d.email_status]||d.email_status)}</span></div>
+    <div class="sect"><h3>Inbound request (self-reported)</h3>
+      <dl class="kv"><dt>asked</dt><dd>${esc(L.request_for)}</dd>
+      <dt>email</dt><dd class="mono">${esc(L.email)}</dd>
+      <dt>source</dt><dd>${esc(L.source)} · ${esc(L.created_at)}</dd></dl></div>
+    <div class="sect"><h3>Enrichment (external firmographics)</h3>
+      <dl class="kv">${enrich}</dl></div>
+    <div class="sect"><h3>Agent journey — every decision, with its why</h3>
+      ${steps || '<p class="muted">no decisions yet</p>'}</div>
+    ${d.draft.subject ? `<div class="sect"><h3>Outreach draft
+        ${d.email_status==='sent' ? '(SENT)' : d.email_status==='drafted' ? '(in Gmail Drafts — check it)' : '(pending approval)'}</h3>
+      <div class="paperbox"><b>${esc(d.draft.subject)}</b>\n\n${esc(d.draft.body)}</div></div>` : ''}
+    <div class="sect"><h3>Delivery ledger (outbox — the idempotency proof)</h3>
+      <table><thead><tr><th>key</th><th>status</th><th>provider id</th></tr></thead>
+      <tbody>${outbox || '<tr><td colspan="3" class="muted small">no side effects yet</td></tr>'}</tbody></table></div>
+    <div class="sect"><h3>Next step</h3><p>${esc(d.next_step||'—')}</p></div>`;
+}
+function closeDrawer(){
+  DRAWER_ID = null;
+  document.getElementById('ov').style.display = 'none';
+  document.getElementById('drawer').style.display = 'none';
+}
+
+/* ------------------------------------------------------------------ actions */
+async function act(action, id, btn){
+  btn.disabled = true; btn.textContent = '…';
+  const r = await post(action, id);
+  if (r.error) alert(action + ' failed: ' + r.error);
+  await refresh(true);
+}
+
+/* ------------------------------------------------------------------ refresh */
+// Anti-flicker contract: the poll only touches the DOM when the underlying
+// data actually changed (or a user action forces it). A steady-state dashboard
+// repaints nothing, so nothing jumps while the pipeline is idle.
+let mainSnapshot = '';
+async function refresh(force){
+  [S, LEADS] = await Promise.all([get('/api/summary'), get('/api/leads')]);
+  const snap = JSON.stringify([S, LEADS]);
+  const changed = snap !== mainSnapshot;
+  mainSnapshot = snap;
+  if (changed) renderTiles();
+  if (TAB === 'pipeline'  && (changed || force)) renderPipeline();
+  if (TAB === 'approvals' && (changed || force)) await renderApprovals();
+  if (TAB === 'obs') await renderObs();          // has its own snapshot guard
+  if (TAB === 'config' && force) await renderConfig();  // static: on demand only
+  if (DRAWER_ID !== null && force) openDrawer(DRAWER_ID);
+}
+refresh(true);
+setInterval(() => refresh(false), 4000);
+</script>
+</body>
+</html>
