@@ -151,7 +151,9 @@
 <nav>
   <button data-tab="pipeline" class="on">Pipeline</button>
   <button data-tab="approvals">Approvals<span class="n" id="n-appr">0</span></button>
+  <button data-tab="rejected">Rejected<span class="n" id="n-rej">0</span></button>
   <button data-tab="obs">Observability</button>
+  <button data-tab="database">Database</button>
   <button data-tab="config">Configure Agent</button>
 </nav>
 
@@ -159,7 +161,9 @@
   <div class="tiles" id="tiles"></div>
   <section id="tab-pipeline"></section>
   <section id="tab-approvals" style="display:none"></section>
+  <section id="tab-rejected" style="display:none"></section>
   <section id="tab-obs" style="display:none"></section>
+  <section id="tab-database" style="display:none"></section>
   <section id="tab-config" style="display:none"></section>
 </main>
 
@@ -194,7 +198,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   TAB = b.dataset.tab;
   document.querySelectorAll('nav button').forEach(x =>
     x.classList.toggle('on', x === b));
-  ['pipeline','approvals','obs','config'].forEach(t =>
+  ['pipeline','approvals','rejected','obs','database','config'].forEach(t =>
     document.getElementById('tab-'+t).style.display = t===TAB ? '' : 'none');
   refresh(true);
 });
@@ -276,12 +280,14 @@ function apprCard(l, d){
   if (st === 'none'){
     act = `<button class="btn primary" onclick="act('approve',${l.inbound_id},this)">
              Approve → create Gmail draft</button>
+           <button class="btn" onclick="rewriteLead(${l.inbound_id},this)">Rewrite…</button>
            <button class="btn" onclick="act('reject',${l.inbound_id},this)">Reject</button>`;
   } else if (st === 'drafted'){
     banner = `<div class="notice">Draft created — open Gmail → Drafts and check
               it. When it reads right, hit Send below.</div>`;
     act = `<button class="btn primary" onclick="act('send',${l.inbound_id},this)">
              Checked — send it</button>
+           <button class="btn" onclick="rewriteLead(${l.inbound_id},this)">Rewrite…</button>
            <button class="btn" onclick="act('reject',${l.inbound_id},this)">Reject &amp; discard draft</button>`;
   }
   const q = (d.decisions.filter(x=>x.stage==='qualify').pop()||{}).raw || {};
@@ -337,6 +343,30 @@ async function renderApprovals(){
         </tr>`).join('')}</tbody></table>` : ''}`;
 }
 
+/* ------------------------------------------------------------------ rejected */
+// The undo queue: a reject is terminal for the pipeline, but a HUMAN can
+// reverse it here (integrations.human_unreject) — the lead returns to the
+// approval queue and the normal approve -> check -> send flow starts over.
+async function renderRejected(){
+  const rows = await get('/api/rejected');
+  document.getElementById('n-rej').textContent = rows.length;
+  document.getElementById('tab-rejected').innerHTML = `
+    <h2 class="tabtitle">Rejected — undo returns the lead to the review queue (${rows.length})</h2>
+    ${rows.length ? `<table><thead><tr><th>#</th><th>Lead</th><th>Tier</th>
+      <th>Reason</th><th>Rejected at (utc)</th><th></th></tr></thead><tbody>
+      ${rows.map(r => `<tr>
+        <td class="mono">${r.inbound_id}</td>
+        <td>${esc(r.name)} — ${esc(r.company)}
+            <span class="muted small">${esc(r.role)}</span></td>
+        <td>${tierBadge(r.final_tier)}</td>
+        <td class="small">${esc(r.reason)}</td>
+        <td class="mono small muted">${esc(r.completed_at||'')}</td>
+        <td><button class="btn primary"
+              onclick="act('unreject',${r.inbound_id},this)">Undo reject</button></td>
+        </tr>`).join('')}</tbody></table>`
+      : '<div class="empty">no rejected leads — nothing to undo</div>'}`;
+}
+
 /* ------------------------------------------------------------------ observability */
 let OBS_PAGE = 1;                 // agent-call pagination (10 per page)
 const OBS_PER_PAGE = 10;
@@ -347,13 +377,15 @@ function setObsFilter(v){ OBS_FILTER = v.trim(); OBS_PAGE = 1; obsSnapshot = '';
 
 async function renderObs(){
   const leadQ = OBS_FILTER ? ('?lead=' + OBS_FILTER) : '';
-  const [events, calls, costs] = await Promise.all([
-    get('/api/events' + leadQ), get('/api/llm' + leadQ), get('/api/costs')]);
+  const [events, calls, costs, tokens] = await Promise.all([
+    get('/api/events' + leadQ), get('/api/llm' + leadQ), get('/api/costs'),
+    get('/api/tokens')]);
 
   // Anti-flicker: identical data + same page/filter -> leave the DOM alone
   // (innerHTML swaps are what cause the visible jump during autorefresh).
   const snap = JSON.stringify([OBS_FILTER, OBS_PAGE, events.length,
-                               calls.length, calls[0]?.id, events[0]?.id]);
+                               calls.length, calls[0]?.id, events[0]?.id,
+                               tokens.map(t=>t.tokens)]);
   if (snap === obsSnapshot) return;
   obsSnapshot = snap;
 
@@ -407,6 +439,20 @@ async function renderObs(){
      <td class="mono">${r.prompt_tokens}</td><td class="mono">${r.completion_tokens}</td>
      <td class="mono">${r.latency_ms}</td></tr>`).join('');
 
+  // Token buckets: cumulative spend per model vs the hard cap. A full bucket
+  // means llm.complete() skips that model and fails over to its backup.
+  const tokenBars = tokens.map(t => {
+    const pct = Math.min(100, Math.round(100 * t.tokens / t.budget));
+    return `
+    <div style="margin-bottom:10px">
+      <div class="small mono">${esc(t.model)} — ${t.tokens.toLocaleString()} /
+        ${t.budget.toLocaleString()} tok (${pct}%) · ${t.calls} calls
+        ${t.exhausted ? '<b> — BUCKET FULL, failing over to backup</b>' : ''}</div>
+      <div style="border:1px solid var(--ink);height:14px">
+        <div style="height:100%;width:${pct}%;background:var(--ink)"></div>
+      </div>
+    </div>`;}).join('');
+
   document.getElementById('tab-obs').innerHTML = `
     <div class="filter">
       <label class="small"><b>Filter by lead #</b></label>
@@ -425,6 +471,9 @@ async function renderObs(){
         <table><thead><tr><th>stage</th><th>calls</th><th>prompt tok</th>
           <th>compl tok</th><th>total ms</th></tr></thead>
           <tbody>${costRows}</tbody></table>
+        <h2 class="tabtitle" style="margin-top:22px">Token buckets — hard cap
+          per model; a full bucket fails over to the backup model</h2>
+        ${tokenBars || '<div class="empty">no model calls yet</div>'}
       </div>
       <div>
         <h2 class="tabtitle">Agent step stream — every transition, decision, tool call, delivery, human action (${events.length})</h2>
@@ -442,64 +491,125 @@ function trackOpen(el){ el.open ? OPEN.add(el.id) : OPEN.delete(el.id); }
 async function renderConfig(){
   const cfg = await get('/api/config');
   const modelInfo = Object.fromEntries(cfg.models.map(m => [m.id, m]));
-  const cards = cfg.layers.map(l => {
-    const opts = cfg.models.map(m =>
-      `<option value="${esc(m.id)}" ${m.id===l.current?'selected':''}>${esc(m.id)}</option>`).join('');
-    return `
+  const optsFor = sel => cfg.models.map(m =>
+    `<option value="${esc(m.id)}" ${m.id===sel?'selected':''}>${esc(m.id)}</option>`).join('');
+  const cards = cfg.layers.map(l => `
     <div class="card">
       <div class="cardhd">
         <span class="who">${esc(l.task.toUpperCase())}</span>
         <span class="muted small">${esc(l.about)}</span>
       </div>
       <div class="cardbd">
-        <div class="row"><b>current</b> <span class="mono">${esc(l.current)}</span>
-          ${l.overridden ? '<span class="flag">override</span>'
+        <div class="row"><b>Main model</b> — does the work.
+          <span class="mono">${esc(l.current)}</span>
+          ${l.overridden ? '<span class="flag">custom</span>'
                          : '<span class="muted small">(default)</span>'}</div>
-        <div class="row"><b>switch to</b>
+        <div class="row">
           <select id="sel-${l.task}" class="mono" style="padding:6px;border:1px solid var(--ink)"
-                  onchange="showNotes('${l.task}')">${opts}</select>
+                  onchange="showNotes('${l.task}')">${optsFor(l.current)}</select>
+          <button class="btn primary" onclick="applyModel('${l.task}','primary')">Set main</button>
+          ${l.overridden ? `<button class="btn" onclick="clearModel('${l.task}','primary')">Reset</button>` : ''}
         </div>
         <div class="row" id="notes-${l.task}"></div>
+        <hr style="border:0;border-top:1px solid #ddd;margin:10px 0">
+        <div class="row"><b>Backup model</b> — used only if the main one is down
+          or hits its token limit.
+          <span class="mono">${esc(l.fallback_current||'—')}</span>
+          ${l.fallback_overridden ? '<span class="flag">custom</span>'
+                                  : '<span class="muted small">(default)</span>'}</div>
+        <div class="row">
+          <select id="fbsel-${l.task}" class="mono" style="padding:6px;border:1px solid var(--ink)"
+                  onchange="showNotes('${l.task}',null,true)">${optsFor(l.fallback_current)}</select>
+          <button class="btn primary" onclick="applyModel('${l.task}','fallback')">Set backup</button>
+          ${l.fallback_overridden ? `<button class="btn" onclick="clearModel('${l.task}','fallback')">Reset</button>` : ''}
+        </div>
+        <div class="row" id="fbnotes-${l.task}"></div>
       </div>
-      <div class="actions">
-        <button class="btn primary" onclick="applyModel('${l.task}')">Apply</button>
-        ${l.overridden ? `<button class="btn" onclick="clearModel('${l.task}')">
-          Reset to default (${esc(l.default)})</button>` : ''}
-      </div>
-    </div>`;
-  }).join('');
+    </div>`).join('');
   document.getElementById('tab-config').innerHTML = `
-    <h2 class="tabtitle">Configure Agent — the multi-LLM abstraction layer, live</h2>
-    <p class="small muted" style="max-width:760px;margin-bottom:16px">
-      Every agent routes through one abstraction (llm.py) to a multi-model proxy,
-      so each layer's model is just a routing entry. Changes here persist to
-      <span class="mono">data/models.json</span> and apply to the next lead
-      processed — no restart, and the CLI picks them up too.</p>
+    <h2 class="tabtitle">Configure Agent — pick the model for each step</h2>
+    <p class="small muted" style="max-width:820px;margin-bottom:16px">
+      Each step of the pipeline uses an AI model. You can change which model does
+      the work (<b>main</b>), and which one takes over if that model is
+      unavailable or has spent its token budget (<b>backup</b>). Changes save to
+      <span class="mono">data/models.json</span> and apply to the next lead — no
+      restart needed.</p>
     ${cards}`;
-  cfg.layers.forEach(l => showNotes(l.task, modelInfo));
+  cfg.layers.forEach(l => { showNotes(l.task, modelInfo); showNotes(l.task, modelInfo, true); });
   window._modelInfo = modelInfo;
 }
-function showNotes(task, info){
+function showNotes(task, info, backup){
   info = info || window._modelInfo || {};
-  const sel = document.getElementById('sel-' + task);
+  const sel = document.getElementById((backup?'fbsel-':'sel-') + task);
+  if (!sel) return;
   const m = info[sel.value];
-  document.getElementById('notes-' + task).innerHTML = m ? `
-    <b>pros</b> ${esc(m.pros)}<br><b style="min-width:86px;display:inline-block">cons</b> ${esc(m.cons)}` : '';
+  document.getElementById((backup?'fbnotes-':'notes-') + task).innerHTML = m ? `
+    <b>good at</b> ${esc(m.pros)}<br><b>watch out</b> ${esc(m.cons)}` : '';
 }
-async function applyModel(task){
-  const sel = document.getElementById('sel-' + task);
+async function applyModel(task, kind){
+  const sel = document.getElementById((kind==='fallback'?'fbsel-':'sel-') + task);
   const r = await fetch('/api/config', {method:'POST',
     headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({task, model: sel.value})});
+    body: JSON.stringify({task, kind, model: sel.value})});
   const d = await r.json();
   if (d.error) alert('failed: ' + d.error);
   renderConfig();
 }
-async function clearModel(task){
+async function clearModel(task, kind){
   await fetch('/api/config', {method:'POST',
     headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({task, model: null})});
+    body: JSON.stringify({task, kind, model: null})});
   renderConfig();
+}
+
+/* ------------------------------------------------------------------ database */
+// Live, read-only window onto the actual SQLite tables — proof that everything
+// on the dashboard is really persisted, updating as the pipeline runs.
+let DB_TABLE = 'lead_runs';      // currently-viewed table
+let dbSnapshot = '';             // anti-flicker guard
+
+function pickTable(name){ DB_TABLE = name; dbSnapshot = ''; renderDatabase(); }
+
+function dbTableHtml(cols, rows){
+  if (!rows.length) return '<div class="empty">no rows</div>';
+  const head = cols.map(c=>`<th>${esc(c)}</th>`).join('');
+  const body = rows.map(row => '<tr>' + cols.map(c => {
+    let v = row[c]; v = v===null ? '' : String(v);
+    const short = v.length > 90 ? v.slice(0,90)+'…' : v;
+    return `<td class="mono small" title="${esc(v)}">${esc(short)}</td>`;
+  }).join('') + '</tr>').join('');
+  return `<div style="overflow:auto;max-height:60vh;border:1px solid var(--ink)">
+    <table style="border:0"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+async function renderDatabase(){
+  const [tables, view] = await Promise.all([
+    get('/api/db/tables'), get('/api/db/table?name='+DB_TABLE+'&limit=100')]);
+  const snap = JSON.stringify([DB_TABLE, tables, view]);
+  if (snap === dbSnapshot) return;               // nothing changed -> no repaint
+  dbSnapshot = snap;
+
+  const rail = tables.map(t =>
+    `<button class="btn ${t.name===DB_TABLE?'primary':''}" style="display:block;width:100%;text-align:left;margin-bottom:4px"
+       onclick="pickTable('${t.name}')">${esc(t.name)}
+       <span class="muted small" style="float:right">${t.rows}</span></button>`).join('');
+
+  document.getElementById('tab-database').innerHTML = `
+    <div class="filter">
+      <span class="muted small">A live, <b>read-only</b> view of the real SQLite
+        database (<code>data/quinn.db</code>). It refreshes every 4s — watch rows
+        appear as the pipeline runs. Nothing on this dashboard is faked; it all
+        comes from here.</span>
+    </div>
+    <div class="twocol" style="grid-template-columns:200px 1fr">
+      <div><h2 class="tabtitle">Tables</h2>${rail}</div>
+      <div>
+        <h2 class="tabtitle">${esc(DB_TABLE)}
+          <span class="muted small">newest ${view.rows?view.rows.length:0} of ${view.total??0} rows</span></h2>
+        ${view.error ? `<div class="empty">${esc(view.error)}</div>`
+                     : dbTableHtml(view.columns||[], view.rows||[])}
+      </div>
+    </div>`;
 }
 
 /* ------------------------------------------------------------------ drawer */
@@ -551,6 +661,12 @@ async function openDrawer(id){
     ${d.draft.subject ? `<div class="sect"><h3>Outreach draft
         ${d.email_status==='sent' ? '(SENT)' : d.email_status==='drafted' ? '(in Gmail Drafts — check it)' : '(pending approval)'}</h3>
       <div class="paperbox"><b>${esc(d.draft.subject)}</b>\n\n${esc(d.draft.body)}</div></div>` : ''}
+    ${(d.grounding||[]).length ? `<div class="sect">
+      <h3>Grounding — verified Telnyx facts this draft was written &amp; checked against (RAG)</h3>
+      <ol class="small" style="padding-left:18px">
+        ${d.grounding.map(g => `<li style="margin-bottom:6px">${esc(g.claim)}
+          <a class="mono small" href="${esc(g.source_url)}" target="_blank" rel="noopener">[${esc(g.product)}]</a></li>`).join('')}
+      </ol></div>` : ''}
     <div class="sect"><h3>Delivery ledger (outbox — the idempotency proof)</h3>
       <table><thead><tr><th>key</th><th>status</th><th>provider id</th></tr></thead>
       <tbody>${outbox || '<tr><td colspan="3" class="muted small">no side effects yet</td></tr>'}</tbody></table></div>
@@ -570,6 +686,24 @@ async function act(action, id, btn){
   await refresh(true);
 }
 
+// Rewrite: third option beside approve/reject — asks for operator feedback,
+// recomposes the draft (grounded, re-approved), discards any stale Gmail draft.
+async function rewriteLead(id, btn){
+  const fb = prompt('Feedback for the new draft (optional — e.g. "shorter, ' +
+                    'lead with pricing, drop the call ask"):');
+  if (fb === null) return;                       // cancelled
+  btn.disabled = true; btn.textContent = 'rewriting…';
+  const r = await fetch('/api/action', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({action:'rewrite', id, feedback: fb})});
+  const d = await r.json();
+  if (d.error) alert('rewrite failed: ' + d.error);
+  else alert(`New draft: "${d.subject}"\n` +
+             (d.approved ? 'Passed the approval gate — review it, then Approve.'
+                         : 'BLOCKED by the approval gate: ' + d.reason));
+  await refresh(true);
+}
+
 /* ------------------------------------------------------------------ refresh */
 // Anti-flicker contract: the poll only touches the DOM when the underlying
 // data actually changed (or a user action forces it). A steady-state dashboard
@@ -581,8 +715,13 @@ async function refresh(force){
   const changed = snap !== mainSnapshot;
   mainSnapshot = snap;
   if (changed) renderTiles();
+  // Badge on the Rejected tab tracks the undo queue (email_status='rejected').
+  document.getElementById('n-rej').textContent =
+    LEADS.filter(l => l.email_status === 'rejected').length;
   if (TAB === 'pipeline'  && (changed || force)) renderPipeline();
   if (TAB === 'approvals' && (changed || force)) await renderApprovals();
+  if (TAB === 'rejected'  && (changed || force)) await renderRejected();
+  if (TAB === 'database') await renderDatabase(); // has its own snapshot guard
   if (TAB === 'obs') await renderObs();          // has its own snapshot guard
   if (TAB === 'config' && force) await renderConfig();  // static: on demand only
   if (DRAWER_ID !== null && force) openDrawer(DRAWER_ID);

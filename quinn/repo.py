@@ -19,6 +19,7 @@ from quinn.schemas import LeadContext
 __all__ = ["LeadContext"]
 
 
+# Current time as a text timestamp — the format every table stores.
 def _now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
 
@@ -27,6 +28,9 @@ def _now() -> str:
 # LeadContext assembly                                                         #
 # --------------------------------------------------------------------------- #
 
+# Fetches one lead's form answers and their company info (two separate
+# tables) and staples them into the single object the AI models reason over.
+# No company info found? It still works, just flagged as a weaker signal.
 def load_lead_context(conn, inbound_id: int) -> LeadContext:
     """Join inbound_requests × enrichment into a LeadContext (ENRICH step)."""
     row = conn.execute(
@@ -72,6 +76,8 @@ def load_lead_context(conn, inbound_id: int) -> LeadContext:
 # lead_runs — the FSM cursor                                                   #
 # --------------------------------------------------------------------------- #
 
+# Finds this lead's progress row, or creates one at the starting state.
+# Calling it twice can't create two rows — the DB enforces one per lead.
 def get_or_create_run(conn, inbound_id: int) -> dict:
     """Idempotent run creation. UNIQUE(inbound_id) => at most one run per lead."""
     now = _now()
@@ -84,6 +90,7 @@ def get_or_create_run(conn, inbound_id: int) -> dict:
     return get_run(conn, inbound_id)
 
 
+# Reads one lead's progress row (which state it's in, what tier it got).
 def get_run(conn, inbound_id: int) -> dict:
     row = conn.execute(
         "SELECT * FROM lead_runs WHERE inbound_id = ?", (inbound_id,)
@@ -91,6 +98,8 @@ def get_run(conn, inbound_id: int) -> dict:
     return dict(row) if row else None
 
 
+# Saves changes to a lead's progress row (new state, tier, error, etc.)
+# and stamps the update time.
 def update_run(conn, inbound_id: int, **fields) -> None:
     """Patch a lead_run row (state / final_tier / attempt_count / last_error)."""
     fields["updated_at"] = _now()
@@ -102,6 +111,7 @@ def update_run(conn, inbound_id: int, **fields) -> None:
     conn.commit()
 
 
+# Returns every lead's progress row, in lead order.
 def list_runs(conn) -> list[dict]:
     rows = conn.execute(
         "SELECT * FROM lead_runs ORDER BY inbound_id"
@@ -113,6 +123,8 @@ def list_runs(conn) -> list[dict]:
 # decisions — append-only audit                                               #
 # --------------------------------------------------------------------------- #
 
+# Writes one verdict (qualify/judge/approve/human) into the permanent audit
+# log. Rows are only ever added, never changed — the history stays honest.
 def record_decision(conn, inbound_id: int, stage: str, verdict: str,
                     rationale: str, model: str, raw_json: str) -> None:
     conn.execute(
@@ -124,6 +136,9 @@ def record_decision(conn, inbound_id: int, stage: str, verdict: str,
     conn.commit()
 
 
+# Checks "did this step already run for this lead?" by fetching its latest
+# saved verdict. This one lookup is what makes re-runs cost zero extra AI
+# calls — if a verdict exists, the pipeline reuses it instead of re-asking.
 def get_decision(conn, inbound_id: int, stage: str) -> dict | None:
     """Return the latest decision row for a (lead, stage), or None.
 
@@ -142,6 +157,9 @@ def get_decision(conn, inbound_id: int, stage: str) -> dict | None:
 # llm_calls — telemetry ledger (observability)                                #
 # --------------------------------------------------------------------------- #
 
+# Saves one row per AI call: which model, how many tokens, how long it took,
+# plus the full prompts and the raw reply — so any decision can be replayed
+# later straight from the database.
 def record_llm_call(conn, row: dict) -> None:
     """Telemetry sink installed into llm.set_recorder. Best-effort by contract:
     llm._record swallows exceptions so a telemetry write never fails a run.
@@ -163,10 +181,39 @@ def record_llm_call(conn, row: dict) -> None:
     conn.commit()
 
 
+# Adds up every token a model has ever spent. The token-bucket check compares
+# this number against the 100k cap before each call.
+def model_tokens_used(conn, model: str) -> int:
+    """Cumulative prompt+completion tokens ever spent on `model`.
+
+    Feeds llm.set_usage_provider — the token-bucket check reads THIS number
+    against llm.TOKEN_BUDGET before every call. Matched on requested_model so
+    proxy-side aliasing of the returned id can't leak spend past the cap."""
+    row = conn.execute(
+        "SELECT COALESCE(SUM(COALESCE(prompt_tokens,0)+COALESCE(completion_tokens,0)),0) t "
+        "FROM llm_calls WHERE requested_model=?", (model,)).fetchone()
+    return int(row["t"])
+
+
+# Builds the per-model spend summary the dashboard's token bars display.
+def model_token_report(conn) -> list[dict]:
+    """Per-model spend for the UI: tokens used, calls, budget, pct."""
+    from quinn import llm  # local import: repo must stay import-light at module level
+    rows = conn.execute(
+        "SELECT requested_model model, COUNT(*) calls, "
+        "COALESCE(SUM(COALESCE(prompt_tokens,0)+COALESCE(completion_tokens,0)),0) tokens "
+        "FROM llm_calls GROUP BY requested_model ORDER BY tokens DESC").fetchall()
+    return [{"model": r["model"], "calls": r["calls"], "tokens": r["tokens"],
+             "budget": llm.TOKEN_BUDGET,
+             "exhausted": r["tokens"] >= llm.TOKEN_BUDGET} for r in rows]
+
+
 # --------------------------------------------------------------------------- #
 # pipeline_events — persisted observability stream                             #
 # --------------------------------------------------------------------------- #
 
+# Saves one pipeline event (a state change, a delivery, a human click) to the
+# events table. This is the sink that obs.event() writes through.
 def record_event(conn, name: str, fields: dict) -> None:
     """Persist one pipeline event (installed into obs.set_event_sink).
 
@@ -185,6 +232,8 @@ def record_event(conn, name: str, fields: dict) -> None:
 # outbox / suppression reads (approver policy checks)                          #
 # --------------------------------------------------------------------------- #
 
+# True if we already completed a send to this lead on this channel — one of
+# the belt-and-suspenders checks against emailing someone twice.
 def prior_send_exists(conn, inbound_id: int, channel: str = "email") -> bool:
     """True if a completed send already exists for this (lead, channel).
 
@@ -197,6 +246,8 @@ def prior_send_exists(conn, inbound_id: int, channel: str = "email") -> bool:
     return row is not None
 
 
+# Checks the do-not-contact list. Matches the exact address OR the whole
+# domain, and returns the reason if found (None = ok to contact).
 def is_suppressed(conn, email: str) -> str | None:
     """Return the suppression reason if `email` (or its domain) is opted out."""
     email = (email or "").lower().strip()
@@ -210,6 +261,7 @@ def is_suppressed(conn, email: str) -> str | None:
     return row["reason"] if row else None
 
 
+# Puts an address (or a whole @domain) on the do-not-contact list.
 def add_suppression(conn, pattern: str, reason: str) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO suppression_list (pattern, reason, created_at) "

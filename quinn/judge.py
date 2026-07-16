@@ -31,6 +31,10 @@ SYSTEM = (
 )
 
 
+# The second opinion. A stronger model re-reads the lead AND the qualifier's
+# verdict, checks every claim against the data, and returns the final tier —
+# it can downgrade freely (its answer wins). If the model is unreachable, it
+# falls back to the qualifier's tier but never upgrades it.
 def judge(ctx: LeadContext, qualifier_verdict: dict) -> tuple[JudgeVerdict, str]:
     """Return (validated JudgeVerdict, model_used). `final_tier` is authoritative."""
     prompt = (

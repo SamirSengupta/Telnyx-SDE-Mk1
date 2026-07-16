@@ -27,6 +27,7 @@ _CONFIGURED = False
 _event_sink: Callable[[str, dict], None] | None = None
 
 
+# Turns on console logging once for the whole app (repeat calls do nothing).
 def setup_logging(level: int = logging.INFO) -> None:
     global _CONFIGURED
     if _CONFIGURED:
@@ -35,12 +36,17 @@ def setup_logging(level: int = logging.INFO) -> None:
     _CONFIGURED = True
 
 
+# Plugs in (or unplugs) the function that saves events to the database.
+# The pipeline sets this at the start of a run and clears it at the end.
 def set_event_sink(fn: Callable[[str, dict], None] | None) -> None:
     """Install (or clear) the DB persistence sink for events. Best-effort."""
     global _event_sink
     _event_sink = fn
 
 
+# The one function everything calls to report "something happened". It prints
+# a log line AND saves a row to pipeline_events (if a sink is plugged in), so
+# the same event shows up in the terminal and on the dashboard.
 def event(logger: logging.Logger, name: str, **fields) -> None:
     """Emit `event=<name> k=v ...` to the log AND persist it (if a sink is set)."""
     parts = [f"event={name}"]

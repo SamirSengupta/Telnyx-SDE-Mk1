@@ -116,6 +116,8 @@ class LeadContext(BaseModel):
     funding_stage: str | None = None
     linkedin_url: str | None = None
 
+    # Turns the lead into the text block the AI models actually read, with
+    # clear labels for what the lead said vs. what we found out about them.
     def as_prompt_block(self) -> str:
         """Render the lead as a compact, unambiguous block for a model prompt."""
         lines = [

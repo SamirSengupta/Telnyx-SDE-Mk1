@@ -64,8 +64,58 @@ TASK_MODELS: dict[str, str] = {
 }
 DEFAULT_MODEL = os.environ.get("QUINN_MODEL_DEFAULT", "claude-sonnet-4-6")
 
-# Bounded retries for transient proxy / format failures.
+# BACKUP model per task — used only when the primary is unusable: transport
+# failure after all retries, or its token budget is exhausted. Deliberately a
+# DIFFERENT vendor/family from the primary where possible (judge falls back to
+# an open-weights GPT-OSS model, not another Claude) so a provider-wide outage
+# doesn't take out both links in the chain. A fallback decision is never
+# silent: telemetry records which model actually answered (requested_model per
+# attempt, used_model on the row, and the model column on the decision).
+FALLBACK_MODELS: dict[str, str] = {
+    "qualify": os.environ.get("QUINN_FALLBACK_QUALIFY", "gemini-3.1-pro-low"),
+    "judge":   os.environ.get("QUINN_FALLBACK_JUDGE",   "gpt-oss-120b-medium"),
+    "compose": os.environ.get("QUINN_FALLBACK_COMPOSE", "claude-sonnet-4-6"),
+    "approve": os.environ.get("QUINN_FALLBACK_APPROVE", "gpt-oss-120b-medium"),
+}
+
+# Bounded retries for transient proxy / format failures (per model in chain).
 MAX_ATTEMPTS = int(os.environ.get("QUINN_LLM_RETRIES", "2"))
+
+# ---- Token bucketing --------------------------------------------------------
+# Hard per-model spend cap (prompt + completion tokens, cumulative across the
+# whole DB). When a model's bucket is full, complete() refuses to call it and
+# moves to the task's fallback; when every model in the chain is capped, the
+# call fails like a transport error and the pipeline's safe defaults take over
+# (qualify -> Cold, judge -> defer, compose/approve -> retry then FAILED).
+# Usage is read through an injected provider (same pattern as the recorder) so
+# this module stays free of DB imports.
+TOKEN_BUDGET = int(os.environ.get("QUINN_TOKEN_BUDGET", "100000"))
+
+_usage_provider: Callable[[str], int] | None = None
+
+
+# Plugs in the function that answers "how many tokens has this model spent?"
+# — the token-bucket check reads through this.
+def set_usage_provider(fn: Callable[[str], int] | None) -> None:
+    """Install (or clear) the tokens-used-per-model lookup. Best-effort: if the
+    provider errors the call proceeds (availability over bookkeeping)."""
+    global _usage_provider
+    _usage_provider = fn
+
+
+# Asks the plugged-in provider for a model's total spend (0 if none plugged).
+def tokens_used(model: str) -> int:
+    if _usage_provider is None:
+        return 0
+    try:
+        return int(_usage_provider(model) or 0)
+    except Exception:                               # noqa: BLE001
+        return 0
+
+
+# True when a model has hit its hard token cap and must not be called.
+def _over_budget(model: str) -> bool:
+    return tokens_used(model) >= TOKEN_BUDGET
 
 
 # --------------------------------------------------------------------------- #
@@ -102,12 +152,15 @@ class LLMResult:
 _recorder: Callable[[dict], None] | None = None
 
 
+# Plugs in (or unplugs) the function that saves each AI call to the database.
 def set_recorder(fn: Callable[[dict], None] | None) -> None:
     """Install (or clear) the per-call telemetry sink. Best-effort."""
     global _recorder
     _recorder = fn
 
 
+# Hands one call record to the saver, and swallows any error — bookkeeping
+# problems must never crash a real run.
 def _record(row: dict) -> None:
     if _recorder is None:
         return
@@ -130,8 +183,11 @@ MODEL_CONFIG_PATH = Path(os.environ.get(
     Path(__file__).resolve().parent.parent / "data" / "models.json"))
 
 
+# Reads the little models.json file where dashboard choices are saved.
 def model_overrides() -> dict[str, str]:
-    """Current operator overrides ({task: model}); {} when none are set."""
+    """Raw operator overrides. Keys are the task name for the PRIMARY model, or
+    'fallback:<task>' for that task's backup model — both live in one flat file
+    so the whole config is a single small JSON blob. {} when none are set."""
     try:
         data = json.loads(MODEL_CONFIG_PATH.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
@@ -139,29 +195,66 @@ def model_overrides() -> dict[str, str]:
         return {}
 
 
-def set_model_override(task: str, model: str | None) -> None:
-    """Persist (or clear, with model=None) one task's model override."""
+# Saves a model choice from the dashboard (main or backup) to models.json,
+# so every process — web, CLI, pipeline — picks it up on the very next call.
+def set_model_override(task: str, model: str | None, kind: str = "primary") -> None:
+    """Persist (or clear, model=None) one task's PRIMARY or fallback model.
+
+    kind='primary' overrides which model runs the task; kind='fallback'
+    overrides which model it fails over to. Both are editable from the
+    dashboard's Configure Agent tab and apply to the next call in every process."""
     if task not in TASK_MODELS:
         raise ValueError(f"unknown task {task!r}")
+    if kind not in ("primary", "fallback"):
+        raise ValueError(f"kind must be primary|fallback, got {kind!r}")
+    key = task if kind == "primary" else f"fallback:{task}"
     overrides = model_overrides()
     if model:
-        overrides[task] = model
+        overrides[key] = model
     else:
-        overrides.pop(task, None)
+        overrides.pop(key, None)
     MODEL_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     MODEL_CONFIG_PATH.write_text(json.dumps(overrides, indent=2), encoding="utf-8")
 
 
+# "Which model does this job?" Dashboard choice wins, then env var, then the
+# built-in default.
 def model_for(task: str) -> str:
-    """Return the concrete model id a logical task routes to.
+    """The concrete PRIMARY model for a task.
 
-    Precedence: dashboard override (models.json) > env var > code default."""
+    Precedence: dashboard override > env var > code default."""
     override = model_overrides().get(task)
     if override:
         return override
     return TASK_MODELS.get(task, DEFAULT_MODEL)
 
 
+# "Which model is the backup for this job?" Same precedence rules as above.
+def fallback_for(task: str) -> str | None:
+    """The concrete BACKUP model for a task (dashboard override > code default)."""
+    override = model_overrides().get(f"fallback:{task}")
+    if override:
+        return override
+    return FALLBACK_MODELS.get(task)
+
+
+# The try-in-this-order list for a job: main model first, then its backup.
+def models_for(task: str) -> list[str]:
+    """The full failover chain for a task: primary, then its backup (deduped).
+
+    complete() walks this list left to right; a model is skipped when its token
+    bucket is full, and abandoned when transport retries are exhausted."""
+    chain = [model_for(task)]
+    fb = fallback_for(task)
+    if fb and fb not in chain:
+        chain.append(fb)
+    return chain
+
+
+# THE way to talk to an AI model — every agent in the app calls this and
+# nothing else. It picks the right model for the job, sends the prompt, checks
+# the reply against the expected shape, retries on garbage, fails over to the
+# backup model if the main one is down or out of budget, and logs everything.
 def complete(
     *,
     task: str,
@@ -191,7 +284,6 @@ def complete(
         LLMTransportError: proxy unreachable / errored (retryable).
         LLMFormatError: schema requested but reply didn't parse/validate (retryable).
     """
-    model = model_for(task)
     sys_prompt = system
     if schema is not None:
         sys_prompt = (
@@ -202,17 +294,48 @@ def complete(
             + json.dumps(schema.model_json_schema(), indent=2)
         )
 
-    body = {
-        "model": model,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "messages": [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": prompt},
-        ],
-    }
-
+    # Failover chain: primary first, then the task's backup model. A model is
+    # skipped outright when its token bucket is full (recorded as budget_skip,
+    # zero network cost) and abandoned when transport retries are exhausted.
     last_exc: Exception | None = None
+    for model in models_for(task):
+        if _over_budget(model):
+            _record(_telemetry_row(inbound_id, stage, task, model, "",
+                                   {}, time.monotonic(), 0, "budget_skip",
+                                   "", prompt, ""))
+            last_exc = LLMTransportError(
+                f"model {model} over token budget ({tokens_used(model)}"
+                f"/{TOKEN_BUDGET}) — skipped")
+            continue
+
+        body = {
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "messages": [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": prompt},
+            ],
+        }
+        result = _try_model(body, model, task, schema, sys_prompt, prompt,
+                            inbound_id, stage)
+        if isinstance(result, LLMResult):
+            return result
+        last_exc = result                     # exception -> try next model
+
+    assert last_exc is not None
+    raise last_exc
+
+
+# Gives ONE model its bounded number of tries. Network hiccup -> wait and
+# retry. Malformed reply -> retry, telling the model what it got wrong. Out of
+# tries -> hand the error back so complete() can move to the backup model.
+def _try_model(body, model, task, schema, sys_prompt, prompt,
+               inbound_id, stage) -> "LLMResult | LLMError":
+    """Run the bounded retry loop against ONE model. Returns an LLMResult on
+    success, or the last exception (so complete() can fail over to the next
+    model in the chain)."""
+    last_exc: LLMError | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         # The system prompt actually sent THIS attempt (a format-error retry
         # appends the rejection nudge) — telemetry records the real payload.
@@ -260,10 +383,14 @@ def complete(
                                sent_system, prompt, text))
         return LLMResult(text=text, data=data, model=used_model, usage=usage)
 
+    # Retries exhausted on this model — hand the failure back so complete()
+    # can fail over to the next model in the task's chain.
     assert last_exc is not None
-    raise last_exc
+    return last_exc
 
 
+# Packs everything about one AI call (who, what, how long, the full prompts
+# and reply) into the dict that gets saved to the llm_calls table.
 def _telemetry_row(inbound_id, stage, task, requested_model, used_model,
                    usage, t0, attempt, outcome,
                    system_prompt="", user_prompt="", response_text="") -> dict:
@@ -290,6 +417,9 @@ def _telemetry_row(inbound_id, stage, task, requested_model, used_model,
 # Transport (kept private — the rest of the app never sees HTTP)              #
 # --------------------------------------------------------------------------- #
 
+# The actual HTTP request to the model proxy. This is the ONLY place in the
+# whole codebase that touches the network for AI — and the one seam the test
+# suite swaps out with a fake.
 def _post_chat(body: dict) -> dict:
     url = f"{PROXY_BASE_URL}/chat/completions"
     data = json.dumps(body).encode("utf-8")
@@ -312,6 +442,7 @@ def _post_chat(body: dict) -> dict:
         raise LLMTransportError(f"proxy unreachable at {url}: {exc}") from exc
 
 
+# Pulls the assistant's text out of the proxy's response envelope.
 def _extract_text(raw: dict) -> str:
     try:
         return raw["choices"][0]["message"]["content"] or ""
@@ -319,6 +450,8 @@ def _extract_text(raw: dict) -> str:
         raise LLMFormatError(f"unexpected proxy response shape: {raw!r}") from exc
 
 
+# Digs the JSON object out of a model reply, forgiving stray code fences or
+# chatter around it. Can't find one -> a retryable format error.
 def _parse_json(text: str) -> dict:
     """Parse a JSON object out of model text, tolerating stray fences/prose."""
     s = text.strip()

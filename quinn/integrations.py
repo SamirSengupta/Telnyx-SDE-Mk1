@@ -58,6 +58,8 @@ class LoggingNotifier:
     def __init__(self, channel: str) -> None:
         self.channel = channel
 
+    # Pretends to send: just prints and returns a fake receipt. This is what
+    # runs when no real credentials are set (e.g. in the tests).
     def send(self, *, idempotency_key: str, payload: dict) -> DeliveryReceipt:
         event(_log, "send", channel=self.channel, key=idempotency_key,
               to=payload.get("to"), subject=payload.get("subject"))
@@ -65,6 +67,8 @@ class LoggingNotifier:
         return DeliveryReceipt(provider_msg_id=msg_id, channel=self.channel)
 
 
+# The raw HTTP POST to Slack's webhook. Raises if Slack answers anything but
+# "ok", so callers know the message truly did not land.
 def _post_slack_webhook(url: str, text: str, blocks: list | None = None) -> None:
     """POST a message to a Slack Incoming Webhook. Raises on non-'ok' response."""
     payload: dict = {"text": text}
@@ -94,6 +98,7 @@ class LiveSlackNotifier:
         self.channel = "slack"
         self._url = webhook_url
 
+    # Formats the payload as Slack blocks (title + detail) and posts it for real.
     def send(self, *, idempotency_key: str, payload: dict) -> DeliveryReceipt:
         title = payload.get("subject") or "New lead"
         detail = payload.get("text") or ""
@@ -122,6 +127,8 @@ class GmailDraftNotifier:
 
     channel = "email"
 
+    # "Sending" on the email channel means creating a DRAFT in Gmail — never
+    # an actual send. The receipt it returns carries the Gmail draft id.
     def send(self, *, idempotency_key: str, payload: dict) -> DeliveryReceipt:
         draft_id = gmail.create_draft(to=payload.get("to", ""),
                                       subject=payload.get("subject", ""),
@@ -131,6 +138,9 @@ class GmailDraftNotifier:
         return DeliveryReceipt(provider_msg_id=draft_id, channel="email")
 
 
+# Decides, per channel, whether to use the real sender or the print-only fake:
+# real Slack only if the webhook env var is set, real Gmail only if creds and
+# a token exist. Tests never load the env file, so they can never go live.
 def _default_notifiers() -> dict[str, Notifier]:
     """Build the channel->notifier registry from the environment.
 
@@ -158,6 +168,8 @@ def _default_notifiers() -> dict[str, Notifier]:
 NOTIFIERS: dict[str, Notifier] = _default_notifiers()
 
 
+# After a full queue run, posts one Slack digest: how many leads, which tiers,
+# what needs a human. Skipped quietly when Slack isn't configured.
 def post_run_summary(conn) -> bool:
     """Post an end-of-run status digest to Slack. No-op (False) if no webhook.
 
@@ -222,6 +234,8 @@ def post_run_summary(conn) -> bool:
 # exactly one terminal outcome per lead's email.
 
 
+# Fires a small "heads up" line to Slack after a human action (approved, sent,
+# un-rejected). Best effort: if Slack is down we log it and move on.
 def _post_followup(text: str) -> None:
     """Best-effort Slack notification for human actions. Not outbox-guarded —
     it is informational, carries no side-effect risk, and must never block or
@@ -235,6 +249,9 @@ def _post_followup(text: str) -> None:
         event(_log, "slack_followup_fail", error=str(exc))
 
 
+# Human step 1 of 2: the operator said "approve" -> NOW the Gmail draft gets
+# created (exactly once, however many times they click). Refuses if the lead
+# was rejected. Follows up on Slack with "check your Drafts".
 def human_approve(conn, inbound_id: int) -> str:
     """Operator approved the outreach -> create the Gmail draft (step 1 of 2).
 
@@ -282,6 +299,9 @@ def human_approve(conn, inbound_id: int) -> str:
     )
     return "drafted"
 
+# Grabs the one-and-only "send ticket" for this lead. Returns None if we got
+# it (or a dead earlier attempt can be retried); returns the final status if
+# the outcome is already settled (sent/rejected), meaning: do nothing.
 def _claim_send(conn, inbound_id: int, key: str) -> str | None:
     """Claim the human-send slot. Returns None if we own it, else its status."""
     try:
@@ -302,6 +322,7 @@ def _claim_send(conn, inbound_id: int, key: str) -> str | None:
         return status            # 'sent' or 'rejected' -> final, do nothing
 
 
+# Looks up the Gmail draft id for this lead, if a draft was ever created.
 def _find_draft(conn, inbound_id: int) -> str | None:
     row = conn.execute(
         "SELECT provider_msg_id FROM outbox WHERE idempotency_key=? AND status='sent'",
@@ -310,6 +331,9 @@ def _find_draft(conn, inbound_id: int) -> str | None:
     return row["provider_msg_id"] if row else None
 
 
+# Human step 2 of 2: the operator checked the draft in Gmail and said "send
+# it". Fires the real email — exactly once, ever, per lead. Already sent or
+# rejected? It reports that and does nothing.
 def human_send(conn, inbound_id: int) -> str:
     """Operator checked the draft -> send it (step 2 of 2). Exactly-once."""
     key = f"send:{inbound_id}:email"
@@ -353,6 +377,62 @@ def human_send(conn, inbound_id: int) -> str:
     return "sent"
 
 
+# Deletes a lead's Gmail draft and its ledger row, so a rewrite or an undo can
+# start clean. Only ever runs because a human asked for it.
+def discard_draft(conn, inbound_id: int) -> bool:
+    """Remove a lead's Gmail draft AND its deliver:{id}:email ledger row.
+
+    Used by rewrite (old content must not survive) and unreject (the reject
+    already deleted the Gmail draft; the stale ledger row must go too so a
+    fresh approve can claim cleanly). A deliberate, audited exception to the
+    append-only ledger — only ever triggered by an explicit operator action."""
+    draft_id = _find_draft(conn, inbound_id)
+    deleted = bool(draft_id) and not draft_id.startswith("logmsg_") \
+        and gmail.delete_draft(draft_id)
+    conn.execute("DELETE FROM outbox WHERE idempotency_key=?",
+                 (f"deliver:{inbound_id}:email",))
+    conn.commit()
+    event(_log, "draft_discarded", inbound_id=inbound_id, draft=draft_id,
+          deleted=deleted)
+    return deleted
+
+
+# The Undo-reject button. Removes the "rejected" mark so the lead goes back
+# into the approval queue. Only rejections can be undone — a sent email is
+# forever.
+def human_unreject(conn, inbound_id: int) -> str:
+    """Operator undo for a rejection -> the lead returns to the approval queue.
+
+    Only a 'rejected' terminal row can be reversed — 'sent' is forever. Removes
+    the send-key row (and any stale draft row via discard_draft) so the normal
+    approve -> check -> send flow starts over, records an audited operator
+    decision, and notifies Slack. Returns 'unrejected' | 'not_rejected' | the
+    existing terminal status."""
+    key = f"send:{inbound_id}:email"
+    row = conn.execute("SELECT status FROM outbox WHERE idempotency_key=?",
+                       (key,)).fetchone()
+    if row is None:
+        event(_log, "human_unreject_skip", inbound_id=inbound_id, already="none")
+        return "not_rejected"
+    if row["status"] != "rejected":
+        event(_log, "human_unreject_skip", inbound_id=inbound_id,
+              already=row["status"])
+        return row["status"]                     # 'sent' can never be undone
+    conn.execute("DELETE FROM outbox WHERE idempotency_key=?", (key,))
+    conn.commit()
+    discard_draft(conn, inbound_id)              # clear any stale draft row too
+    record_decision(conn, inbound_id, "human", "unreject",
+                    "operator reversed the rejection — lead returned to the "
+                    "approval queue", "operator", json.dumps({}))
+    event(_log, "human_unreject", inbound_id=inbound_id)
+    _post_followup(f":leftwards_arrow_with_hook: Lead {inbound_id} — rejection "
+                   "undone; back in the review queue.")
+    return "unrejected"
+
+
+# The Reject button. Marks the lead's email as permanently off (deleting any
+# Gmail draft), so no approve or send can ever fire for it — unless a human
+# later uses Undo-reject.
 def human_reject(conn, inbound_id: int, reason: str = "rejected by operator") -> str:
     """Operator rejected the draft -> discard it. Blocks any later send."""
     key = f"send:{inbound_id}:email"
@@ -381,12 +461,18 @@ def human_reject(conn, inbound_id: int, reason: str = "rejected by operator") ->
     return "rejected"
 
 
+# Fingerprints the exact content being sent (SHA-256), stored as proof of
+# what went out under each ticket.
 def _payload_hash(payload: dict) -> str:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode("utf-8")
     ).hexdigest()
 
 
+# The exactly-once machine. Before sending anything it writes a uniquely-keyed
+# ticket row (CLAIM); then it sends; then it records the result (COMMIT).
+# Because the database refuses a second ticket with the same key, no retry,
+# crash, or double-click can ever send the same thing twice.
 def deliver_once(conn, inbound_id: int, channel: str, payload: dict) -> str:
     """Send exactly once for (lead, channel). Returns the outbox status.
 

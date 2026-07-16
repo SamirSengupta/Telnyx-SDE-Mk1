@@ -12,13 +12,15 @@ from __future__ import annotations
 import datetime as _dt
 
 from quinn.db import DB_PATH, get_connection, init_db
+from quinn.knowledge_data import FACTS
 from quinn.seed_data import RECORDS
 
-# Suppression / opt-out seeds. "@souqexpress.ae" matches a seeded Hot lead so the
-# approver's compliance gate visibly blocks it (parks in HELD); the others are
-# generic examples of the kinds of entries this list holds.
+# Suppression / opt-out seeds. "@shopify.com" matches a seeded good-fit lead so
+# the approver's compliance gate visibly blocks it (parks in HELD) even though
+# it qualifies well — the "great fit, but we're not allowed to email them"
+# demo. The others are generic examples of the kinds of entries this list holds.
 SUPPRESSION_SEEDS = (
-    ("@souqexpress.ae", "do-not-contact"),
+    ("@shopify.com", "do-not-contact"),
     ("optout@example.com", "opt-out"),
 )
 
@@ -40,6 +42,8 @@ ENRICHMENT_FIELDS = (
 )
 
 
+# Wipes and reloads the demo data: 10 leads split into the two input tables,
+# the do-not-contact list, and the Telnyx fact base. Run it for a fresh start.
 def seed(conn) -> tuple[int, int]:
     """Insert every record, returning (inbound_count, enrichment_count)."""
     init_db(conn)
@@ -86,17 +90,46 @@ def seed(conn) -> tuple[int, int]:
             (pattern, reason, now),
         )
 
+    seed_knowledge(conn)
+
     conn.commit()
     return inbound_n, enrichment_n
 
 
+# Wipes and reloads the verified Telnyx facts, so the table always exactly
+# matches knowledge_data.py — a corrected claim or source link can't leave a
+# stale copy behind.
+def seed_knowledge(conn) -> int:
+    """Reload the curated Telnyx fact base (the grounding source for outreach).
+
+    Wipe-and-reload, same as the lead seeder: the knowledge table is read-only
+    reference data, so regenerating it from the authored list is always safe
+    and guarantees edits (fixed URLs, updated claims) fully replace old rows."""
+    now = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+    conn.execute("DELETE FROM knowledge;")
+    n = 0
+    for f in FACTS:
+        conn.execute(
+            "INSERT INTO knowledge "
+            "(topic, product, claim, tags, source_url, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (f["topic"], f["product"], f["claim"], f["tags"], f["source_url"], now),
+        )
+        n += 1
+    conn.commit()
+    return n
+
+
+# Lets you run "py -m quinn.seed" from the terminal to reload the demo data.
 def main() -> None:
     conn = get_connection()
     try:
         inbound_n, enrichment_n = seed(conn)
+        facts_n = conn.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0]
     finally:
         conn.close()
-    print(f"Seeded {inbound_n} inbound requests and {enrichment_n} enrichment rows -> {DB_PATH}")
+    print(f"Seeded {inbound_n} inbound requests, {enrichment_n} enrichment rows, "
+          f"{facts_n} Telnyx facts -> {DB_PATH}")
 
 
 if __name__ == "__main__":

@@ -19,6 +19,8 @@ from pathlib import Path
 ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 
 
+# Reads the .env file line by line and copies each KEY=value into the process
+# environment, so the rest of the app can find secrets like the Slack webhook.
 def load_env(path: Path | None = None) -> None:
     path = path or ENV_PATH
     if not path.exists():

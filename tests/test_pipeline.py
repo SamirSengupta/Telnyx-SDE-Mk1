@@ -26,6 +26,9 @@ from quinn.seed import seed
 # system prompt to tell which stage is calling.                               #
 # --------------------------------------------------------------------------- #
 
+# The fake model. Looks at which agent is asking (by its system prompt) and
+# returns a canned, well-formed answer — so the whole pipeline can run with
+# zero network. Swapped in over llm._post_chat, the one seam that talks HTTP.
 def _fake_post(body: dict) -> dict:
     sys = body["messages"][0]["content"]
     usr = body["messages"][1]["content"]
@@ -56,6 +59,7 @@ def _fake_post(body: dict) -> dict:
             "usage": {"prompt_tokens": 120, "completion_tokens": 40}}
 
 
+# Builds a brand-new throwaway database with the demo data, for one test.
 def _fresh_db():
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
@@ -114,11 +118,11 @@ def test_suppression_blocks_send():
     held = conn.execute("SELECT ir.email FROM lead_runs lr "
                         "JOIN inbound_requests ir ON ir.id=lr.inbound_id "
                         "WHERE lr.state='HELD'").fetchall()
-    assert any(r["email"].endswith("@souqexpress.ae") for r in held), \
+    assert any(r["email"].endswith("@shopify.com") for r in held), \
         "suppressed lead should be HELD"
     sent_to_suppressed = conn.execute(
         "SELECT COUNT(*) c FROM outbox o JOIN inbound_requests ir ON ir.id=o.inbound_id "
-        "WHERE ir.email LIKE '%@souqexpress.ae' AND o.channel='email'").fetchone()["c"]
+        "WHERE ir.email LIKE '%@shopify.com' AND o.channel='email'").fetchone()["c"]
     assert sent_to_suppressed == 0, "suppressed recipient must never be emailed"
     print("  suppression OK — opted-out lead parked in HELD, no email")
 
@@ -207,6 +211,48 @@ def test_validation_error_is_retried():
     print("  validation-retry OK — bad reply -> format_error -> retried -> ok")
 
 
+def test_fallback_and_token_budget():
+    """Primary model unusable -> the task's backup answers. Two triggers:
+    transport failure (proxy/model down) and a full token bucket (hard cap)."""
+    from quinn.schemas import TierVerdict
+    primary = llm.model_for("qualify")
+    backup = llm.FALLBACK_MODELS["qualify"]
+    good = {"tier": "Warm", "icp_fit": 0.5, "intent": 0.5, "signals": [],
+            "disqualifiers": [], "rationale": "ok"}
+
+    def primary_down(body):
+        if body["model"] == primary:
+            raise llm.LLMTransportError("simulated primary outage")
+        return {"choices": [{"message": {"content": json.dumps(good)}}],
+                "model": body["model"],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 5}}
+
+    llm._post_chat = primary_down
+    recorded = []
+    llm.set_recorder(recorded.append)
+    try:
+        # 1. Transport failover: primary exhausts retries -> backup answers.
+        res = llm.complete(task="qualify", system="x", prompt="y", schema=TierVerdict)
+        assert res.model == backup, f"expected fallback {backup}, got {res.model}"
+        outcomes = [r["outcome"] for r in recorded]
+        assert outcomes.count("transport_error") == llm.MAX_ATTEMPTS, outcomes
+        assert outcomes[-1] == "ok"
+
+        # 2. Token bucket: primary reported at the cap -> skipped with ZERO
+        #    network attempts (budget_skip row), backup takes the call.
+        recorded.clear()
+        llm.set_usage_provider(lambda m: llm.TOKEN_BUDGET if m == primary else 0)
+        res2 = llm.complete(task="qualify", system="x", prompt="y", schema=TierVerdict)
+        assert res2.model == backup
+        assert recorded[0]["outcome"] == "budget_skip", recorded[0]["outcome"]
+        assert recorded[0]["requested_model"] == primary
+    finally:
+        llm.set_recorder(None)
+        llm.set_usage_provider(None)
+    print("  fallback OK — primary outage and full bucket both fail over "
+          f"({primary} -> {backup})")
+
+
 def test_human_approval_gate():
     """The two-step human gate: approve creates the draft (exactly once), send
     fires it (exactly once), reject blocks everything downstream forever."""
@@ -246,6 +292,24 @@ def test_human_approval_gate():
     human_rows = conn.execute("SELECT COUNT(*) c FROM decisions "
                               "WHERE stage='human'").fetchone()["c"]
     assert human_rows == 3, "approve + send + reject all audited"
+
+    # UNDO: unreject returns lead 2 to the queue; approve then works again.
+    from quinn.agent import human_rewrite
+    from quinn.integrations import human_unreject
+    assert human_unreject(conn, 2) == "unrejected"
+    assert human_unreject(conn, 1) == "sent", "a sent lead can never be unrejected"
+    assert human_approve(conn, 2) == "drafted", "after undo, approve works again"
+
+    # REWRITE: recompose with feedback -> a NEW approve decision (append-only),
+    # old draft discarded, and the fresh draft is approvable again.
+    n_before = conn.execute("SELECT COUNT(*) c FROM decisions "
+                            "WHERE inbound_id=2 AND stage='approve'").fetchone()["c"]
+    res = human_rewrite(conn, 2, "shorter please")
+    assert res["approved"] and res["subject"], res
+    n_after = conn.execute("SELECT COUNT(*) c FROM decisions "
+                           "WHERE inbound_id=2 AND stage='approve'").fetchone()["c"]
+    assert n_after == n_before + 1, "rewrite must append a new approve decision"
+    assert human_approve(conn, 2) == "drafted", "rewritten draft approvable"
     # Qualifier topic flowed through to the stored draft.
     d = json.loads(conn.execute(
         "SELECT raw_json FROM decisions WHERE inbound_id=1 AND stage='approve'"
@@ -256,9 +320,10 @@ def test_human_approval_gate():
 
 ALL = [test_idempotency_and_no_double_spend, test_suppression_blocks_send,
        test_reconcile_after_delivery_failure, test_validation_error_is_retried,
-       test_human_approval_gate]
+       test_fallback_and_token_budget, test_human_approval_gate]
 
 
+# Runs every test in order and prints a pass/fail summary.
 def main():
     for t in ALL:
         print(f"* {t.__name__}")

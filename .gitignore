@@ -20,3 +20,7 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+
+# ---- Large media (exceeds GitHub 100MB limit) ----
+demo.mp4
+*.mp4

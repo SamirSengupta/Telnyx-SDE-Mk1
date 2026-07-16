@@ -16,8 +16,11 @@ DATA_DIR = ROOT_DIR / "data"
 DB_PATH = DATA_DIR / "quinn.db"
 SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 RUNTIME_SCHEMA_PATH = Path(__file__).resolve().parent / "schema_runtime.sql"
+KNOWLEDGE_SCHEMA_PATH = Path(__file__).resolve().parent / "schema_knowledge.sql"
 
 
+# Opens the SQLite database file and returns a connection the caller can use.
+# Every part of the app gets its DB access through this one function.
 def get_connection(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
     """Return a connection with sane defaults.
 
@@ -35,6 +38,8 @@ def get_connection(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
     return conn
 
 
+# Creates all the tables (if they don't exist yet) by running the three
+# schema files, then applies any column upgrades. Safe to call many times.
 def init_db(conn: sqlite3.Connection) -> None:
     """Create tables from the schema files if they don't already exist.
 
@@ -45,10 +50,14 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
     if RUNTIME_SCHEMA_PATH.exists():
         conn.executescript(RUNTIME_SCHEMA_PATH.read_text(encoding="utf-8"))
+    if KNOWLEDGE_SCHEMA_PATH.exists():
+        conn.executescript(KNOWLEDGE_SCHEMA_PATH.read_text(encoding="utf-8"))
     _migrate(conn)
     conn.commit()
 
 
+# Adds columns that newer versions of the app need to a database created by an
+# older version. Each ALTER quietly no-ops if the column is already there.
 def _migrate(conn: sqlite3.Connection) -> None:
     """Bring an existing DB up to the current schema.
 

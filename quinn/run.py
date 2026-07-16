@@ -34,18 +34,20 @@ import json
 
 import quinn.config  # noqa: F401 — MUST precede other quinn imports: loads .env so
 #                      integrations picks up live creds (Slack webhook) at import.
-from quinn.agent import NEXT_STEP, TERMINAL, reopen, run_lead
+from quinn.agent import NEXT_STEP, TERMINAL, human_rewrite, reopen, run_lead
 from quinn.db import get_connection, init_db
 from quinn.integrations import (
     human_approve,
     human_reject,
     human_send,
+    human_unreject,
     post_run_summary,
 )
 from quinn.obs import set_event_sink
 from quinn.repo import record_event
 
 
+# Prints the state of every lead plus the two "waiting on a human" queues.
 def cmd_status(conn) -> None:
     runs = conn.execute("SELECT * FROM lead_runs ORDER BY inbound_id").fetchall()
     if not runs:
@@ -88,6 +90,8 @@ def cmd_status(conn) -> None:
               f"check Gmail Drafts, then --send-mail ID / --reject-mail ID")
 
 
+# Prints one lead's whole life story — every decision, AI call, and delivery
+# in time order, rebuilt purely from what's saved in the database.
 def cmd_trace(conn, inbound_id: int) -> None:
     """Chronological merge of decisions + llm_calls + outbox for one lead."""
     run = conn.execute("SELECT * FROM lead_runs WHERE inbound_id=?", (inbound_id,)).fetchone()
@@ -116,6 +120,7 @@ def cmd_trace(conn, inbound_id: int) -> None:
         print(f"  {ts}  {kind:<9} {line}")
 
 
+# Prints how many AI calls and tokens each pipeline stage has spent.
 def cmd_costs(conn) -> None:
     print(f"{'stage':<10} {'calls':>6} {'prompt_tok':>11} {'compl_tok':>10} {'ms':>8}")
     print("-" * 50)
@@ -137,6 +142,8 @@ def cmd_costs(conn) -> None:
 # Interactive review console — the human half of the workflow                  #
 # --------------------------------------------------------------------------- #
 
+# Finds the leads whose review card is up but no human has decided yet —
+# the review console's work queue, hottest first.
 def _awaiting_approval(conn) -> list:
     """Leads whose Slack review card is posted (state DONE) but which the human
     has not yet approved (no deliver:{id}:email draft) or rejected (no
@@ -153,6 +160,7 @@ def _awaiting_approval(conn) -> list:
     ).fetchall()
 
 
+# Fetches one saved verdict's details as a plain dict (empty if none yet).
 def _decision_doc(conn, inbound_id: int, stage: str) -> dict:
     row = conn.execute(
         "SELECT raw_json FROM decisions WHERE inbound_id=? AND stage=? "
@@ -160,6 +168,8 @@ def _decision_doc(conn, inbound_id: int, stage: str) -> dict:
     return json.loads(row["raw_json"]) if row else {}
 
 
+# Prints everything a reviewer needs for one lead in the terminal: who they
+# are, why they got their tier, what the judge said, and the draft itself.
 def _print_review_card(conn, iid: int, pos: int, total: int) -> None:
     """Terminal mirror of the Slack card: everything needed to decide, inline."""
     lead = conn.execute("SELECT * FROM inbound_requests WHERE id=?", (iid,)).fetchone()
@@ -188,6 +198,9 @@ def _print_review_card(conn, iid: int, pos: int, total: int) -> None:
     print("=" * 72)
 
 
+# The interactive approval console: shows one lead at a time and waits for
+# you to type approve / rewrite / reject / skip. Approve creates the Gmail
+# draft and pauses until you've checked it — then moves to the next lead.
 def cmd_review(conn) -> None:
     """One lead at a time: show the full why, wait for the operator's verdict.
 
@@ -205,7 +218,7 @@ def cmd_review(conn) -> None:
         iid = r["inbound_id"]
         _print_review_card(conn, iid, pos, len(rows))
         while True:
-            ans = input("  approve / reject / skip / quit > ").strip().lower()
+            ans = input("  approve / rewrite / reject / skip / quit > ").strip().lower()
             if ans in ("approve", "a"):
                 status = human_approve(conn, iid)
                 if status == "drafted":
@@ -215,10 +228,18 @@ def cmd_review(conn) -> None:
                 else:
                     print(f"  -> {status}")
                 break
+            if ans in ("rewrite", "w"):
+                fb = input("  feedback for the new draft (optional) > ").strip()
+                res = human_rewrite(conn, iid, fb)
+                print(f"  -> new draft: \"{res['subject']}\" "
+                      f"({'passed the gate' if res['approved'] else 'BLOCKED: ' + res['reason'][:80]})")
+                _print_review_card(conn, iid, pos, len(rows))   # show the new draft
+                continue                     # same lead: approve/reject the rewrite
             if ans in ("reject", "r"):
                 reason = input("  reason (optional) > ").strip() \
                     or "rejected by operator"
-                print(f"  -> {human_reject(conn, iid, reason)}")
+                print(f"  -> {human_reject(conn, iid, reason)} "
+                      "(undo later: --unreject or the Rejected tab)")
                 break
             if ans in ("skip", "s"):
                 break
@@ -229,6 +250,7 @@ def cmd_review(conn) -> None:
     cmd_status(conn)
 
 
+# Processes every lead in the queue, then posts the Slack summary.
 def cmd_all(conn, verbose: bool) -> None:
     ids = [r["id"] for r in conn.execute(
         "SELECT id FROM inbound_requests ORDER BY id").fetchall()]
@@ -239,6 +261,8 @@ def cmd_all(conn, verbose: bool) -> None:
         print("posted run summary to Slack (#all-telnyx-agent)")
 
 
+# Picks up every lead that got interrupted mid-pipeline and finishes it.
+# Finished steps are skipped, so resuming costs almost nothing.
 def cmd_resume(conn, verbose: bool) -> None:
     placeholders = ",".join("?" for _ in TERMINAL)
     rows = conn.execute(
@@ -253,6 +277,7 @@ def cmd_resume(conn, verbose: bool) -> None:
         run_lead(conn, r["inbound_id"], verbose=verbose)
 
 
+# Reads the command-line flags and calls the matching command above.
 def main() -> None:
     p = argparse.ArgumentParser(prog="quinn.run", description="Quinn inbound orchestrator")
     g = p.add_mutually_exclusive_group(required=True)
@@ -271,6 +296,10 @@ def main() -> None:
                    help="human step 2: send the checked Gmail draft")
     g.add_argument("--reject-mail", type=int, metavar="ID",
                    help="human rejection: discard the lead's Gmail draft")
+    g.add_argument("--rewrite", type=int, metavar="ID",
+                   help="human: recompose the lead's draft (prompts for feedback)")
+    g.add_argument("--unreject", type=int, metavar="ID",
+                   help="human: undo a rejection — lead returns to the review queue")
     p.add_argument("--quiet", action="store_true", help="less per-state logging")
     args = p.parse_args()
 
@@ -288,8 +317,10 @@ def main() -> None:
         elif args.costs:
             cmd_costs(conn)
         elif args.reopen is not None:
-            run = reopen(conn, args.reopen)
-            print(f"reopened lead {args.reopen} -> {run['state']} (now run --resume)")
+            reopen(conn, args.reopen)
+            final = run_lead(conn, args.reopen, verbose=verbose)  # re-drive now
+            print(f"re-armed lead {args.reopen} -> {final['state']} "
+                  f"(tier={final.get('final_tier')})")
         elif args.review:
             cmd_review(conn)
         elif args.approve_mail is not None:
@@ -303,6 +334,14 @@ def main() -> None:
         elif args.reject_mail is not None:
             status = human_reject(conn, args.reject_mail)
             print(f"lead {args.reject_mail} email: {status}")
+        elif args.rewrite is not None:
+            fb = input("feedback for the new draft (optional) > ").strip()
+            res = human_rewrite(conn, args.rewrite, fb)
+            print(f"lead {args.rewrite} new draft: \"{res['subject']}\" "
+                  f"({'passed the gate' if res['approved'] else 'BLOCKED: ' + res['reason'][:100]})")
+        elif args.unreject is not None:
+            status = human_unreject(conn, args.unreject)
+            print(f"lead {args.unreject}: {status}")
         elif args.all:
             cmd_all(conn, verbose)
             cmd_status(conn)

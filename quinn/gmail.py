@@ -63,6 +63,7 @@ class GmailNotAuthorized(GmailError):
 # OAuth plumbing                                                               #
 # --------------------------------------------------------------------------- #
 
+# Reads the Google app credentials file (client id + secret) from disk.
 def _client() -> dict:
     if not CREDS_PATH.exists():
         raise GmailError(f"missing OAuth client file: {CREDS_PATH}")
@@ -70,6 +71,7 @@ def _client() -> dict:
     return node.get("installed") or node.get("web") or node
 
 
+# Posts a form to Google's token endpoint and returns the JSON reply.
 def _post_form(url: str, fields: dict) -> dict:
     data = urllib.parse.urlencode(fields).encode()
     req = urllib.request.Request(url, data=data, method="POST",
@@ -82,6 +84,7 @@ def _post_form(url: str, fields: dict) -> dict:
                          f"{exc.read().decode('utf-8', 'replace')[:300]}") from exc
 
 
+# Caches the access/refresh tokens to a local (gitignored) file.
 def _save_token(tok: dict) -> None:
     # Preserve the refresh_token across refreshes (Google omits it on refresh).
     if TOKEN_PATH.exists():
@@ -91,6 +94,8 @@ def _save_token(tok: dict) -> None:
     TOKEN_PATH.write_text(json.dumps(tok, indent=2), encoding="utf-8")
 
 
+# Returns a valid access token, silently refreshing the expired one with the
+# saved refresh token when needed.
 def _access_token() -> str:
     """Return a valid access token, refreshing via the cached refresh_token."""
     if not TOKEN_PATH.exists():
@@ -109,6 +114,8 @@ def _access_token() -> str:
     return fresh["access_token"]
 
 
+# Quick yes/no: has the one-time Gmail authorization been completed on this
+# machine? (Decides whether the real Gmail sender goes live.)
 def is_configured() -> bool:
     """True when both the OAuth client and a cached user token exist."""
     return CREDS_PATH.exists() and TOKEN_PATH.exists()
@@ -130,6 +137,8 @@ class _CodeCatcher(http.server.BaseHTTPRequestHandler):
     codes: list[str] = []
     error: str | None = None
 
+    # Catches Google's redirect after the user clicks "Allow" and pockets the
+    # one-time code from the URL.
     def do_GET(self):                                          # noqa: N802
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         code = (qs.get("code") or [None])[0]
@@ -153,6 +162,9 @@ class _CodeCatcher(http.server.BaseHTTPRequestHandler):
         pass
 
 
+# The one-time setup: prints a Google sign-in link, waits for the user to
+# approve in their browser, catches the redirect, and saves the tokens.
+# After this, Quinn can create drafts in that Gmail account.
 def run_consent_flow() -> None:
     """Interactive one-time authorization. Prints the URL; the USER approves.
 
@@ -221,6 +233,7 @@ def run_consent_flow() -> None:
 # Gmail REST calls (drafts only)                                               #
 # --------------------------------------------------------------------------- #
 
+# One helper for every Gmail REST call: adds the auth header, sends, parses.
 def _api(method: str, path: str, body: dict | None = None) -> dict:
     req = urllib.request.Request(
         f"{GMAIL_API}{path}",
@@ -238,6 +251,7 @@ def _api(method: str, path: str, body: dict | None = None) -> dict:
                          f"{exc.read().decode('utf-8', 'replace')[:300]}") from exc
 
 
+# Puts an email into the Drafts folder (does NOT send) and returns its id.
 def create_draft(*, to: str, subject: str, body: str) -> str:
     """Create a draft in the connected mailbox. Returns the draft id."""
     msg = EmailMessage()
@@ -249,12 +263,14 @@ def create_draft(*, to: str, subject: str, body: str) -> str:
     return out["id"]
 
 
+# Actually sends a draft that's already sitting in the Drafts folder.
 def send_draft(draft_id: str) -> str:
     """Send an existing draft (the human-approval action). Returns message id."""
     out = _api("POST", "/drafts/send", {"id": draft_id})
     return out.get("id", "")
 
 
+# Deletes a draft from the Drafts folder (used on reject / rewrite).
 def delete_draft(draft_id: str) -> bool:
     """Discard a rejected draft. Best-effort — True on success."""
     try:

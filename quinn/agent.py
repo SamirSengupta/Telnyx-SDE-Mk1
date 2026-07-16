@@ -31,7 +31,7 @@ import logging
 import time
 import traceback
 
-from quinn import approver, email_composer, judge, llm, repo
+from quinn import approver, email_composer, integrations, judge, knowledge, llm, repo
 from quinn.db import get_connection, init_db
 from quinn.integrations import deliver_once
 from quinn.obs import event, set_event_sink, setup_logging
@@ -91,6 +91,9 @@ QUALIFIER_SYSTEM = (
 )
 
 
+# The first-pass sorter. Shows the lead to a fast model and asks "Hot, Warm,
+# Mild, or Cold — and what are they asking about?". If the model can't be
+# reached at all, it plays safe and answers Cold (don't contact).
 def qualify(ctx: LeadContext) -> tuple[TierVerdict, str]:
     """Return (validated TierVerdict, model_used)."""
     prompt = ctx.as_prompt_block() + "\n\nAssign the tier. Return JSON."
@@ -110,11 +113,15 @@ def qualify(ctx: LeadContext) -> tuple[TierVerdict, str]:
 # State handlers — each returns (next_state, patch_dict_for_lead_runs)        #
 # --------------------------------------------------------------------------- #
 
+# Room 1: the lead just arrived. Its data was already fetched, so this step
+# simply moves it forward.
 def _h_received(conn, ctx, run):
     # ENRICH: context is already assembled by the driver; nothing else to do.
     return "ENRICHED", {}
 
 
+# Room 2: run the qualifier — unless a saved verdict already exists (from an
+# earlier run), in which case reuse it and spend nothing.
 def _h_enriched(conn, ctx, run):
     if get_decision(conn, ctx.inbound_id, "qualify") is None:   # resume-skip guard
         verdict, model = qualify(ctx)
@@ -127,6 +134,8 @@ def _h_enriched(conn, ctx, run):
     return "QUALIFIED", {}
 
 
+# Room 3: the judge double-checks the qualifier's tier. Whatever the judge
+# says becomes the final tier. Same reuse rule as above on re-runs.
 def _h_qualified(conn, ctx, run):
     prior = get_decision(conn, ctx.inbound_id, "judge")
     if prior is not None:                                       # resume-skip guard
@@ -142,6 +151,8 @@ def _h_qualified(conn, ctx, run):
     return "JUDGED", {"final_tier": verdict.final_tier}
 
 
+# Room 4: the fork. Cold leads exit here for good (SUPPRESSED — never
+# contacted). Everyone else moves on to get an email written.
 def _h_judged(conn, ctx, run):
     tier = run["final_tier"]
     if tier == "Cold":
@@ -150,10 +161,21 @@ def _h_judged(conn, ctx, run):
     return "COMPOSED", {}
 
 
+# Room 5: fetch the verified Telnyx facts, have the writer draft the email
+# grounded in them, then run the draft through the approval gate. Pass ->
+# onward. Blocked -> the lead parks in HELD for a human. On re-runs the saved
+# outcome is reused — except right after a human clicked Re-arm, which forces
+# a fresh compose.
 def _h_composed(conn, ctx, run):
     tier = run["final_tier"]
     prior = get_decision(conn, ctx.inbound_id, "approve")
-    if prior is not None:                                       # resume-skip guard
+    # Resume-skip guard — BUT an operator Re-arm (reopen) that happened AFTER the
+    # last approve decision means the human explicitly asked to retry, so we must
+    # NOT reuse that (blocked) decision; we recompose fresh below. Without this,
+    # Re-arm would just re-read the old block and bounce the lead back to HELD.
+    op = get_decision(conn, ctx.inbound_id, "operator")
+    rearmed = op is not None and prior is not None and op["id"] > prior["id"]
+    if prior is not None and not rearmed:
         payload = json.loads(prior["raw_json"])
         event(_log, "decision_reused", inbound_id=ctx.inbound_id, stage="approve")
         if prior["verdict"] != "pass":
@@ -164,15 +186,23 @@ def _h_composed(conn, ctx, run):
     # Topic-routed template: the qualifier classified WHY they reached out.
     topic = _latest_decision(conn, ctx.inbound_id, "qualify") \
         .get("primary_topic", "platform_other")
-    draft, cmodel = email_composer.compose(ctx, tier, topic)
-    verdict, amodel = approver.approve(conn, ctx, tier, draft)
+    # GROUNDING: pull verified Telnyx facts for this lead's topic + ask, so the
+    # composer writes and the approver checks against a citable fact base rather
+    # than the model's parametric memory. Recorded on the decision for audit.
+    facts = knowledge.retrieve_facts(conn, topic, ctx)
+    facts_block = knowledge.format_facts(facts)
+    event(_log, "tool_call", inbound_id=ctx.inbound_id, tool="retrieve_facts",
+          topic=topic, facts=len(facts))
+    draft, cmodel = email_composer.compose(ctx, tier, topic, facts_block)
+    verdict, amodel = approver.approve(conn, ctx, tier, draft, facts_block)
     draft_record = {**draft.model_dump(), "topic": topic,
                     "channels": email_composer.channels_for(tier)}
     record_decision(conn, ctx.inbound_id, "approve",
                     "pass" if verdict.approved else "block",
                     verdict.reason, amodel,
                     json.dumps({"approval": verdict.model_dump(),
-                                "draft": draft_record, "compose_model": cmodel}))
+                                "draft": draft_record, "compose_model": cmodel,
+                                "grounding_facts": knowledge.fact_refs(facts)}))
     event(_log, "decision", inbound_id=ctx.inbound_id, stage="approve",
           verdict="pass" if verdict.approved else "block", model=amodel)
     if not verdict.approved:
@@ -181,6 +211,8 @@ def _h_composed(conn, ctx, run):
     return "APPROVED", {}
 
 
+# Room 6: post the review card to Slack (exactly once) and stop. The machine's
+# work ends here — no email exists yet; that takes a human clicking approve.
 def _h_approved(conn, ctx, run):
     # HUMAN GATE (the workflow's stop-the-line moment): the pipeline delivers
     # ONLY the Slack review card here — tier, the qualifier's why, the judge's
@@ -203,6 +235,7 @@ def _h_approved(conn, ctx, run):
     return "DELIVERED", {}
 
 
+# Room 7: card is up — mark the automated journey DONE (= "awaiting human").
 def _h_delivered(conn, ctx, run):
     return "DONE", {}
 
@@ -222,6 +255,10 @@ HANDLERS = {
 # The driver                                                                  #
 # --------------------------------------------------------------------------- #
 
+# The engine. Walks one lead room by room until it reaches an end state,
+# saving progress after every step. Errors get a bounded number of retries
+# (3 per lead, total) before the lead parks in FAILED for a human. Safe to
+# call again anytime — finished work is never redone or re-billed.
 def run_lead(conn, inbound_id: int, *, verbose: bool = True) -> dict:
     """Drive one lead through the FSM until it reaches a terminal state.
 
@@ -235,6 +272,9 @@ def run_lead(conn, inbound_id: int, *, verbose: bool = True) -> dict:
     # FSM event is persisted for the observability surfaces (--trace, web UI).
     llm.set_recorder(functools.partial(record_llm_call, conn))
     set_event_sink(functools.partial(record_event, conn))
+    # Token bucketing: let llm.complete() read cumulative per-model spend so it
+    # can skip a model whose 100k bucket is full and fail over to its backup.
+    llm.set_usage_provider(functools.partial(repo.model_tokens_used, conn))
 
     ctx = load_lead_context(conn, inbound_id)
     # Tool call #1 of every run: the enrichment lookup (in prod: Apollo/Clearbit
@@ -278,12 +318,15 @@ def run_lead(conn, inbound_id: int, *, verbose: bool = True) -> dict:
 
     llm.set_recorder(None)
     set_event_sink(None)
+    llm.set_usage_provider(None)
     final = get_run(conn, inbound_id)
     if verbose:
         print(f"  [{inbound_id}] -> {final['state']} (tier={final.get('final_tier')})")
     return final
 
 
+# The bouncer. Refuses any state jump that isn't on the LEGAL list, so even a
+# buggy handler can't push a lead somewhere it shouldn't go.
 def _assert_legal(frm: str, to: str) -> None:
     if to not in LEGAL.get(frm, set()):
         raise RuntimeError(f"illegal transition {frm} -> {to}")
@@ -296,6 +339,8 @@ def _assert_legal(frm: str, to: str) -> None:
 _REOPEN_TARGET = {"HELD": "COMPOSED", "FAILED": "ENRICHED"}
 
 
+# The Re-arm button. Takes a parked lead (HELD or FAILED), resets its retry
+# budget, and puts it back in the pipeline so the next run tries it fresh.
 def reopen(conn, inbound_id: int) -> dict:
     """Re-arm a parked run. Legal only from HELD/FAILED. Records an operator
     audit row and resets the lifetime attempt budget so the human's decision to
@@ -315,15 +360,88 @@ def reopen(conn, inbound_id: int) -> dict:
     return get_run(conn, inbound_id)
 
 
+# The Rewrite button. Throws away the current draft (and its Gmail copy, if
+# one exists), writes a new one guided by the operator's feedback, re-runs the
+# approval gate, and saves the result as a new decision. The old draft stays
+# in the history — nothing is ever erased from the audit trail.
+def human_rewrite(conn, inbound_id: int, feedback: str = "") -> dict:
+    """Operator asks for a NEW draft (with optional feedback) before approving.
+
+    Third option beside approve/reject: recompose the email — showing the model
+    the previous draft plus the operator's notes — re-run the approval gate,
+    and append a NEW approve decision (append-only: the old draft stays in the
+    audit trail; the latest decision is what approve/draft flows read). Any
+    existing Gmail draft is discarded first so stale content can never be the
+    thing that gets sent. Not allowed once sent; a rejected lead must be
+    un-rejected first."""
+    setup_logging()
+    llm.set_recorder(functools.partial(record_llm_call, conn))
+    set_event_sink(functools.partial(record_event, conn))
+    llm.set_usage_provider(functools.partial(repo.model_tokens_used, conn))
+    try:
+        run = get_run(conn, inbound_id)
+        if run is None or run.get("final_tier") not in ("Hot", "Warm", "Mild"):
+            raise ValueError(f"lead {inbound_id} has no outreach-tier run to rewrite")
+        srow = conn.execute("SELECT status FROM outbox WHERE idempotency_key=?",
+                            (f"send:{inbound_id}:email",)).fetchone()
+        if srow and srow["status"] == "sent":
+            raise RuntimeError(f"lead {inbound_id}'s email was already sent — "
+                               "nothing to rewrite")
+        if srow and srow["status"] == "rejected":
+            raise RuntimeError(f"lead {inbound_id} is rejected — undo the "
+                               "reject first (Rejected tab / --unreject)")
+
+        ctx = load_lead_context(conn, inbound_id)
+        tier = run["final_tier"]
+        topic = _latest_decision(conn, inbound_id, "qualify") \
+            .get("primary_topic", "platform_other")
+        previous = _latest_draft(conn, inbound_id)
+
+        # Old Gmail draft (if approved already) must die BEFORE the new pass —
+        # both so the approver's prior-send policy check doesn't fire and so a
+        # stale draft can never linger next to the new content.
+        integrations.discard_draft(conn, inbound_id)
+
+        facts = knowledge.retrieve_facts(conn, topic, ctx)
+        facts_block = knowledge.format_facts(facts)
+        event(_log, "tool_call", inbound_id=inbound_id, tool="retrieve_facts",
+              topic=topic, facts=len(facts))
+        draft, cmodel = email_composer.compose(ctx, tier, topic, facts_block,
+                                               feedback=feedback,
+                                               previous=previous)
+        verdict, amodel = approver.approve(conn, ctx, tier, draft, facts_block)
+        draft_record = {**draft.model_dump(), "topic": topic,
+                        "channels": email_composer.channels_for(tier)}
+        record_decision(conn, inbound_id, "approve",
+                        "pass" if verdict.approved else "block",
+                        verdict.reason, amodel,
+                        json.dumps({"approval": verdict.model_dump(),
+                                    "draft": draft_record,
+                                    "compose_model": cmodel,
+                                    "grounding_facts": knowledge.fact_refs(facts),
+                                    "rewrite": True, "feedback": feedback}))
+        event(_log, "human_rewrite", inbound_id=inbound_id,
+              approved=verdict.approved, feedback_len=len(feedback))
+        return {"approved": verdict.approved, "subject": draft.subject,
+                "reason": verdict.reason}
+    finally:
+        llm.set_recorder(None)
+        set_event_sink(None)
+        llm.set_usage_provider(None)
+
+
 # --------------------------------------------------------------------------- #
 # Small helpers                                                                #
 # --------------------------------------------------------------------------- #
 
+# Grabs the newest saved verdict for one step and unpacks its JSON details.
 def _latest_decision(conn, inbound_id: int, stage: str) -> dict:
     d = get_decision(conn, inbound_id, stage)
     return json.loads(d["raw_json"]) if d else {}
 
 
+# Recovers the saved email draft from the decision log (used after a crash,
+# when the in-memory copy is gone).
 def _latest_draft(conn, inbound_id: int) -> dict:
     """Re-derive the approved draft from the stored approve decision (crash resume)."""
     d = _latest_decision(conn, inbound_id, "approve")
@@ -341,6 +459,9 @@ NEXT_STEP = {
 }
 
 
+# Builds what actually gets sent on a channel: for Slack, the rich review card
+# (who, why this tier, what the judge said, next step); for email, the
+# to/subject/body of the draft.
 def _payload_for(channel: str, ctx: LeadContext, tier: str, draft: dict,
                  conn=None) -> dict:
     if channel == "slack":
@@ -403,6 +524,7 @@ def _payload_for(channel: str, ctx: LeadContext, tier: str, draft: dict,
 # Convenience entrypoints (thin; run.py is the real CLI)                      #
 # --------------------------------------------------------------------------- #
 
+# Runs every lead in the inbound queue through the pipeline, one at a time.
 def run_all(conn=None, *, verbose: bool = True) -> list[dict]:
     own = conn is None
     conn = conn or get_connection()
